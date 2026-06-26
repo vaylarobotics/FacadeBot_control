@@ -1,0 +1,1 @@
+This repo contains the main control archetecture for the FacadeBot arm. The main control logic runs Rpi which also does the vision processing and the motors use the hiwondover board along with the esp32 to work as a driver to communicate with the Rpi.
