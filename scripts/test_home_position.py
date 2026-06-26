@@ -19,11 +19,13 @@ RESPONSE_TIMEOUT_SEC  = 10   # how long to wait for ESP32 to confirm the move
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Move FacadeBot arm to home position.")
+    parser = argparse.ArgumentParser(description="Move FacadeBot arm to a named position.")
     parser.add_argument("--port", default=DEFAULT_PORT,
                         help=f"Serial port for the ESP32 (default: {DEFAULT_PORT})")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD,
                         help=f"Baud rate (default: {DEFAULT_BAUD})")
+    parser.add_argument("--pose", default="home", choices=["home", "position_b"],
+                        help="Named position to move to (default: home)")
     args = parser.parse_args()
 
     print(f"Connecting to ESP32 on {args.port} at {args.baud} baud...")
@@ -38,8 +40,8 @@ def main():
     time.sleep(BOOT_WAIT_SEC)
     port.reset_input_buffer()
 
-    print("Sending home command...")
-    port.write(b'{"cmd": "home"}\n')
+    print(f"Sending {args.pose} command...")
+    port.write(f'{{"cmd": "{args.pose}"}}\n'.encode())
 
     deadline = time.monotonic() + RESPONSE_TIMEOUT_SEC
     while time.monotonic() < deadline:
@@ -52,7 +54,7 @@ def main():
             continue
 
         if response.get("status") == "ok":
-            print("All servos moved to home position.")
+            print(f"All servos moved to {args.pose}.")
             port.close()
             sys.exit(0)
         else:
