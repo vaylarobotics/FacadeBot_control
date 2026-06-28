@@ -20,8 +20,7 @@ TCP_PORT         = 5000                   # port the ESP32 listens on for comman
 # UART2 (GPIO16/17) is wired to the BusLinker V2.5 TTL header.
 SERVO_IDS        = [1, 2, 3, 4]    # one servo per joint, base to end effector
 HOME_POSITION    = 500              # center of 0–1000 range (= 120° physical)
-POSITION_B       = [300, 600, 400, 700]  # target pose B, one value per servo ID in SERVO_IDS order
-MOVE_DURATION_MS = 1000            # time in ms for each servo to reach target position
+MOVE_DURATION_MS = 1000            # time in ms used by the home command
 BAUD_BUSLINKER   = 115200
 TX2_PIN          = 17              # ESP32 GPIO17 → BusLinker TTL RX
 RX2_PIN          = 16              # ESP32 GPIO16 ← BusLinker TTL TX
@@ -58,16 +57,14 @@ def build_move_packet(servo_id: int, position: int, duration_ms: int) -> bytes:
                   checksum])
 
 
+def move_joints(positions: list, duration_ms: int) -> None:
+    for servo_id, position in zip(SERVO_IDS, positions):
+        uart_buslinker.write(build_move_packet(servo_id, position, duration_ms))
+        time.sleep_ms(_INTER_SERVO_DELAY_MS)
+
+
 def move_all_to_home() -> None:
-    for servo_id in SERVO_IDS:
-        uart_buslinker.write(build_move_packet(servo_id, HOME_POSITION, MOVE_DURATION_MS))
-        time.sleep_ms(_INTER_SERVO_DELAY_MS)
-
-
-def move_to_position_b() -> None:
-    for servo_id, position in zip(SERVO_IDS, POSITION_B):
-        uart_buslinker.write(build_move_packet(servo_id, position, MOVE_DURATION_MS))
-        time.sleep_ms(_INTER_SERVO_DELAY_MS)
+    move_joints([HOME_POSITION] * len(SERVO_IDS), MOVE_DURATION_MS)
 
 
 def connect_wifi() -> network.WLAN:
@@ -99,9 +96,16 @@ def handle_client(conn: socket.socket) -> None:
         if cmd.get("cmd") == "home":
             move_all_to_home()
             conn.sendall(b'{"status": "ok"}\n')
-        elif cmd.get("cmd") == "position_b":
-            move_to_position_b()
-            conn.sendall(b'{"status": "ok"}\n')
+        elif cmd.get("cmd") == "move":
+            positions = cmd.get("positions")
+            duration_ms = cmd.get("duration_ms")
+            if not isinstance(positions, list) or len(positions) != len(SERVO_IDS):
+                conn.sendall(b'{"status": "error", "msg": "positions must be a list with one value per servo"}\n')
+            elif not isinstance(duration_ms, int):
+                conn.sendall(b'{"status": "error", "msg": "duration_ms must be an integer"}\n')
+            else:
+                move_joints(positions, duration_ms)
+                conn.sendall(b'{"status": "ok"}\n')
         else:
             conn.sendall(b'{"status": "error", "msg": "unknown command"}\n')
 
