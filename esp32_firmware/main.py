@@ -1,17 +1,27 @@
 import json
-import sys
+import network
+import socket
 import time
-import uselect
 from machine import UART, Pin
+
+# ── Wi-Fi and TCP configuration ───────────────────────────────────────────────
+# Fill in your network credentials and router gateway before flashing.
+WIFI_SSID        = "TP-Link_08F3_5G"       # replace with your network name
+WIFI_PASSWORD    = "16288935"   # replace with your network password
+STATIC_IP        = "192.168.1.100"        # fixed IP the ESP32 will claim — pick one
+                                           # not already in use on your network
+SUBNET_MASK      = "255.255.255.0"
+GATEWAY          = "192.168.1.1"          # your router's IP — run `ip route` on RPi to confirm
+DNS              = "8.8.8.8"
+TCP_PORT         = 5000                   # port the ESP32 listens on for commands
 
 # ── Hardware configuration ────────────────────────────────────────────────────
 # Confirm GPIO pins match your physical wiring before flashing.
-# RPi communication uses sys.stdin/stdout (UART0 is already owned by MicroPython REPL).
-# UART2 (GPIO 16/17) is wired to the BusLinker V2.5 TTL header.
+# UART2 (GPIO16/17) is wired to the BusLinker V2.5 TTL header.
 SERVO_IDS        = [1, 2, 3, 4]    # one servo per joint, base to end effector
 HOME_POSITION    = 500              # center of 0–1000 range (= 120° physical)
 POSITION_B       = [300, 600, 400, 700]  # target pose B, one value per servo ID in SERVO_IDS order
-MOVE_DURATION_MS = 1000            # time in ms for each servo to reach home
+MOVE_DURATION_MS = 1000            # time in ms for each servo to reach target position
 BAUD_BUSLINKER   = 115200
 TX2_PIN          = 17              # ESP32 GPIO17 → BusLinker TTL RX
 RX2_PIN          = 16              # ESP32 GPIO16 ← BusLinker TTL TX
@@ -19,17 +29,17 @@ RX2_PIN          = 16              # ESP32 GPIO16 ← BusLinker TTL TX
 # ── Servo protocol constants ──────────────────────────────────────────────────
 # LX-16A packet: 0x55 0x55 ID LEN CMD [PARAMS...] CHECKSUM
 # LEN = num_params + 3 (covers CMD + PARAMS + CHECKSUM)
-_CMD_MOVE_TIME_WRITE = 1
-_POSITION_MIN        = 0
-_POSITION_MAX        = 1000
-_DURATION_MIN_MS     = 100
-_DURATION_MAX_MS     = 5000
+_CMD_MOVE_TIME_WRITE  = 1
+_POSITION_MIN         = 0
+_POSITION_MAX         = 1000
+_DURATION_MIN_MS      = 100
+_DURATION_MAX_MS      = 5000
 _INTER_SERVO_DELAY_MS = 20  # gap between back-to-back sends on the bus
 
 uart_buslinker = UART(2, baudrate=BAUD_BUSLINKER, tx=Pin(TX2_PIN), rx=Pin(RX2_PIN))
 
 
-def build_move_packet(servo_id, position, duration_ms):
+def build_move_packet(servo_id: int, position: int, duration_ms: int) -> bytes:
     position    = max(_POSITION_MIN, min(_POSITION_MAX, position))
     duration_ms = max(_DURATION_MIN_MS, min(_DURATION_MAX_MS, duration_ms))
 
@@ -48,48 +58,72 @@ def build_move_packet(servo_id, position, duration_ms):
                   checksum])
 
 
-def move_all_to_home():
+def move_all_to_home() -> None:
     for servo_id in SERVO_IDS:
         uart_buslinker.write(build_move_packet(servo_id, HOME_POSITION, MOVE_DURATION_MS))
         time.sleep_ms(_INTER_SERVO_DELAY_MS)
 
 
-def move_to_position_b():
+def move_to_position_b() -> None:
     for servo_id, position in zip(SERVO_IDS, POSITION_B):
         uart_buslinker.write(build_move_packet(servo_id, position, MOVE_DURATION_MS))
         time.sleep_ms(_INTER_SERVO_DELAY_MS)
 
 
-def main():
-    # poll with a timeout so Ctrl+C can always interrupt the loop
-    poller = uselect.poll()
-    poller.register(sys.stdin, uselect.POLLIN)
+def connect_wifi() -> network.WLAN:
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    # Set static IP before connecting so the address is predictable
+    wlan.ifconfig((STATIC_IP, SUBNET_MASK, GATEWAY, DNS))
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    while not wlan.isconnected():
+        time.sleep_ms(200)
+    return wlan
 
-    print('{"status": "ready"}')
 
+def handle_client(conn: socket.socket) -> None:
+    """Read JSON commands from one connected client and send responses until it disconnects."""
+    conn.sendall(b'{"status": "ready"}\n')
+    f = conn.makefile('rb')
     while True:
-        ready = poller.poll(100)  # wait up to 100 ms then loop — keeps Ctrl+C responsive
-        if not ready:
-            continue
-
-        line = sys.stdin.readline()
+        line = f.readline()
         if not line:
-            continue
+            break  # client closed the connection
 
         try:
             cmd = json.loads(line.strip())
         except ValueError:
-            print('{"status": "error", "msg": "invalid json"}')
+            conn.sendall(b'{"status": "error", "msg": "invalid json"}\n')
             continue
 
         if cmd.get("cmd") == "home":
             move_all_to_home()
-            print('{"status": "ok"}')
+            conn.sendall(b'{"status": "ok"}\n')
         elif cmd.get("cmd") == "position_b":
             move_to_position_b()
-            print('{"status": "ok"}')
+            conn.sendall(b'{"status": "ok"}\n')
         else:
-            print('{"status": "error", "msg": "unknown command"}')
+            conn.sendall(b'{"status": "error", "msg": "unknown command"}\n')
+
+
+def main() -> None:
+    connect_wifi()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # SO_REUSEADDR lets the ESP32 rebind immediately after a reset without
+    # waiting for the OS to release the port (avoids "address already in use")
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('', TCP_PORT))
+    server.listen(1)
+
+    while True:
+        conn, addr = server.accept()
+        try:
+            handle_client(conn)
+        except OSError:
+            pass  # network errors during a session — just accept the next client
+        finally:
+            conn.close()
 
 
 main()

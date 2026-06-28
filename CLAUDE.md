@@ -14,6 +14,36 @@ FacadeBot is a robotic arm designed for building facade work (exterior painting,
 
 Communication between the RPi and ESP32 is **under evaluation** — both Wi-Fi/TCP and Serial/UART are being tested. Code that depends on the transport should be written behind an abstraction so the underlying link can be swapped without touching higher-level logic.
 
+## Project Status
+
+> Keep this section current. Update it at the end of any session that changes hardware state, installs something, or completes a milestone. This is the single source of truth so the user doesn't have to re-explain what's done each session.
+
+### Hardware
+| Item | Status |
+|------|--------|
+| Physical wiring: RPi ↔ ESP32 (Serial/UART) | ✅ Done |
+| Physical wiring: ESP32 ↔ Hiwonder board | ✅ Done |
+| Servos physically connected to Hiwonder board | ✅ Done |
+| Servos moving on command | ✅ Done |
+
+### Software
+| Item | Status |
+|------|--------|
+| ROS2 installed and working on RPi | ✅ Done |
+| ESP32 firmware: MicroPython script flashed | ✅ Done |
+| Transport chosen: Serial/UART (RPi ↔ ESP32) | ✅ Decided |
+| ESP32 receiving and acting on commands | ✅ Done |
+| Transport abstraction layer (send_command / read_response) | ⬜ Not started |
+| `esp32_bridge` ROS2 node | ⬜ Not started |
+| `facade_control` ROS2 node | ⬜ Not started |
+| `facade_vision` pipeline | ⬜ Not started |
+| `facade_msgs` custom message package | ⬜ Not started |
+| Bounds-checking for joint commands | ⬜ Not started |
+| Emergency-stop logic | ⬜ Not started |
+
+### Current blocker
+None — full chain is working end to end. Root cause of previous servo non-response: TX/RX wires between ESP32 UART2 (GPIO16/17) and BusLinker were not crossed over (TX was wired to TX, RX to RX). Fixed by swapping to TX→RX and RX→TX.
+
 ## Software Stack
 
 - **Python** — ROS2 nodes, vision pipeline, high-level control logic (runs on RPi)
