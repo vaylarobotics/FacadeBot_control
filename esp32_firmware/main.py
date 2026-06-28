@@ -6,7 +6,7 @@ from machine import UART, Pin
 
 # ── Wi-Fi and TCP configuration ───────────────────────────────────────────────
 # Fill in your network credentials and router gateway before flashing.
-WIFI_SSID        = "TP-Link_08F3_5G"       # replace with your network name
+WIFI_SSID        = "TP-Link_08F3"       # replace with your network name
 WIFI_PASSWORD    = "16288935"   # replace with your network password
 STATIC_IP        = "192.168.1.100"        # fixed IP the ESP32 will claim — pick one
                                            # not already in use on your network
