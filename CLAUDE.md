@@ -33,6 +33,7 @@ Communication between the RPi and ESP32 is **under evaluation** — both Wi-Fi/T
 | ESP32 firmware: MicroPython script flashed | ✅ Done |
 | Transport chosen: Serial/UART (RPi ↔ ESP32) | ✅ Decided |
 | ESP32 receiving and acting on commands | ✅ Done |
+| Servo position readback (CMD_POS_READ, stall detection) | ⬜ Not started — next priority |
 | Transport abstraction layer (send_command / read_response) | ⬜ Not started |
 | `esp32_bridge` ROS2 node | ⬜ Not started |
 | `facade_control` ROS2 node | ⬜ Not started |

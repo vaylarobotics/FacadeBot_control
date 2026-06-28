@@ -29,13 +29,24 @@ RX2_PIN          = 16              # ESP32 GPIO16 ← BusLinker TTL TX
 # LX-16A packet: 0x55 0x55 ID LEN CMD [PARAMS...] CHECKSUM
 # LEN = num_params + 3 (covers CMD + PARAMS + CHECKSUM)
 _CMD_MOVE_TIME_WRITE  = 1
+_CMD_POS_READ         = 0x1C  # LX-16A position read command
 _POSITION_MIN         = 0
 _POSITION_MAX         = 1000
 _DURATION_MIN_MS      = 100
 _DURATION_MAX_MS      = 5000
-_INTER_SERVO_DELAY_MS = 20  # gap between back-to-back sends on the bus
+_INTER_SERVO_DELAY_MS = 20    # gap between back-to-back sends on the bus
 
-uart_buslinker = UART(2, baudrate=BAUD_BUSLINKER, tx=Pin(TX2_PIN), rx=Pin(RX2_PIN))
+# ── Read response constants ───────────────────────────────────────────────────
+# A position read response is 8 bytes: 0x55 0x55 ID 5 CMD POS_LO POS_HI CHECKSUM
+# Some BusLinker variants echo the 6-byte request back on RX before the response.
+# _READ_MAX_BYTES covers both cases so we can scan for the valid response pattern.
+_READ_RESPONSE_BYTES  = 8     # bytes in a valid position read response
+_READ_MAX_BYTES       = 14    # _READ_RESPONSE_BYTES + 6-byte echo if BusLinker echoes TX
+_READ_TIMEOUT_MS      = 10    # ms to wait for first RX byte; servo responds in ~1–2 ms at 115200 baud
+_READ_TIMEOUT_CHAR_MS = 5     # ms allowed between successive RX bytes
+
+uart_buslinker = UART(2, baudrate=BAUD_BUSLINKER, tx=Pin(TX2_PIN), rx=Pin(RX2_PIN),
+                      timeout=_READ_TIMEOUT_MS, timeout_char=_READ_TIMEOUT_CHAR_MS)
 
 
 def build_move_packet(servo_id: int, position: int, duration_ms: int) -> bytes:
@@ -57,6 +68,12 @@ def build_move_packet(servo_id: int, position: int, duration_ms: int) -> bytes:
                   checksum])
 
 
+def build_read_packet(servo_id: int) -> bytes:
+    length   = 3  # 0 params + 3
+    checksum = (~(servo_id + length + _CMD_POS_READ)) & 0xFF
+    return bytes([0x55, 0x55, servo_id, length, _CMD_POS_READ, checksum])
+
+
 def move_joints(positions: list, duration_ms: int) -> None:
     for servo_id, position in zip(SERVO_IDS, positions):
         uart_buslinker.write(build_move_packet(servo_id, position, duration_ms))
@@ -65,6 +82,31 @@ def move_joints(positions: list, duration_ms: int) -> None:
 
 def move_all_to_home() -> None:
     move_joints([HOME_POSITION] * len(SERVO_IDS), MOVE_DURATION_MS)
+
+
+def read_servo_position(servo_id: int) -> int | None:
+    uart_buslinker.write(build_read_packet(servo_id))
+    raw = uart_buslinker.read(_READ_MAX_BYTES)
+    if raw is None:
+        return None
+    # Scan for valid response pattern regardless of whether TX bytes were echoed back.
+    # Response: 0x55 0x55 ID 5 _CMD_POS_READ POS_LO POS_HI CHECKSUM
+    for i in range(len(raw) - 7):
+        if (raw[i]   == 0x55        and
+                raw[i+1] == 0x55        and
+                raw[i+2] == servo_id    and
+                raw[i+3] == 5           and
+                raw[i+4] == _CMD_POS_READ):
+            return (raw[i+6] << 8) | raw[i+5]
+    return None
+
+
+def read_all_positions() -> list:
+    positions = []
+    for servo_id in SERVO_IDS:
+        positions.append(read_servo_position(servo_id))
+        time.sleep_ms(_INTER_SERVO_DELAY_MS)
+    return positions
 
 
 def connect_wifi() -> network.WLAN:
@@ -106,6 +148,9 @@ def handle_client(conn: socket.socket) -> None:
             else:
                 move_joints(positions, duration_ms)
                 conn.sendall(b'{"status": "ok"}\n')
+        elif cmd.get("cmd") == "read_positions":
+            positions = read_all_positions()
+            conn.sendall(json.dumps({"status": "ok", "positions": positions}).encode() + b'\n')
         else:
             conn.sendall(b'{"status": "error", "msg": "unknown command"}\n')
 
