@@ -16,11 +16,9 @@ DNS              = "8.8.8.8"
 TCP_PORT         = 5000                   # port the ESP32 listens on for commands
 
 # ── Hardware configuration ────────────────────────────────────────────────────
-# Confirm GPIO pins match your physical wiring before flashing.
+# Confirm GPIO pins match yur pour physical wiring before flashing.
 # UART2 (GPIO16/17) is wired to the BusLinker V2.5 TTL header.
 SERVO_IDS        = [1, 2, 3, 4]    # one servo per joint, base to end effector
-HOME_POSITION    = 500              # center of 0–1000 range (= 120° physical)
-MOVE_DURATION_MS = 1000            # time in ms used by the home command
 BAUD_BUSLINKER   = 115200
 TX2_PIN          = 17              # ESP32 GPIO17 → BusLinker TTL RX
 RX2_PIN          = 16              # ESP32 GPIO16 ← BusLinker TTL TX
@@ -47,6 +45,18 @@ _READ_TIMEOUT_CHAR_MS = 5     # ms allowed between successive RX bytes
 
 uart_buslinker = UART(2, baudrate=BAUD_BUSLINKER, tx=Pin(TX2_PIN), rx=Pin(RX2_PIN),
                       timeout=_READ_TIMEOUT_MS, timeout_char=_READ_TIMEOUT_CHAR_MS)
+
+# ── Minimum-jerk trajectory shaping ───────────────────────────────────────────
+# Interval between trajectory steps. move_joints() blocks ~_TRAJECTORY_WRITE_MS
+# per call (UART write cost for 4 servos) - this must stay well above that or
+# steps queue up faster than the bus can execute them. ~1.9x margin, empirical.
+_TRAJECTORY_STEP_MS = 150
+_TRAJECTORY_WRITE_MS = _INTER_SERVO_DELAY_MS * len(SERVO_IDS)  # ~80ms
+
+# Fallback trajectory start position when a pre-move readback misses a servo
+# (read_servo_position returns None). None until the first successful move -
+# we never guess a "last known" position at boot.
+_last_commanded_positions_raw = None
 
 
 def build_move_packet(servo_id: int, position: int, duration_ms: int) -> bytes:
@@ -80,11 +90,9 @@ def move_joints(positions: list, duration_ms: int) -> None:
         time.sleep_ms(_INTER_SERVO_DELAY_MS)
 
 
-def move_all_to_home() -> None:
-    move_joints([HOME_POSITION] * len(SERVO_IDS), MOVE_DURATION_MS)
-
-
 def read_servo_position(servo_id: int) -> int | None:
+    if uart_buslinker.any():
+        uart_buslinker.read()  # drain stale bytes left over from a late servo response
     uart_buslinker.write(build_read_packet(servo_id))
     raw = uart_buslinker.read(_READ_MAX_BYTES)
     if raw is None:
@@ -107,6 +115,42 @@ def read_all_positions() -> list:
         positions.append(read_servo_position(servo_id))
         time.sleep_ms(_INTER_SERVO_DELAY_MS)
     return positions
+
+
+def _min_jerk_position(start: int, end: int, tau: float) -> int:
+    # Flash & Hogan minimum-jerk model: closed-form quintic with zero
+    # velocity/acceleration at both endpoints. tau in [0,1].
+    scale = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+    return round(start + (end - start) * scale)
+
+
+def move_joints_min_jerk(positions: list, duration_ms: int) -> None:
+    global _last_commanded_positions_raw
+
+    duration_ms_clamped = max(_DURATION_MIN_MS, min(_DURATION_MAX_MS, duration_ms))
+
+    start_positions = read_all_positions()
+    for i in range(len(SERVO_IDS)):
+        if start_positions[i] is None:
+            if _last_commanded_positions_raw is not None:
+                start_positions[i] = _last_commanded_positions_raw[i]
+            else:
+                start_positions[i] = positions[i]  # no known start - skip shaping this joint
+
+    step_count = max(1, duration_ms_clamped // _TRAJECTORY_STEP_MS)
+    step_duration_ms = duration_ms_clamped // step_count
+    step_sleep_ms = max(0, step_duration_ms - _TRAJECTORY_WRITE_MS)
+
+    for step in range(1, step_count + 1):
+        tau = step / step_count
+        step_positions = [
+            _min_jerk_position(start_positions[i], positions[i], tau)
+            for i in range(len(SERVO_IDS))
+        ]
+        move_joints(step_positions, step_duration_ms)
+        time.sleep_ms(step_sleep_ms)
+
+    _last_commanded_positions_raw = positions
 
 
 def connect_wifi() -> network.WLAN:
@@ -135,10 +179,7 @@ def handle_client(conn: socket.socket) -> None:
             conn.sendall(b'{"status": "error", "msg": "invalid json"}\n')
             continue
 
-        if cmd.get("cmd") == "home":
-            move_all_to_home()
-            conn.sendall(b'{"status": "ok"}\n')
-        elif cmd.get("cmd") == "move":
+        if cmd.get("cmd") == "move":
             positions = cmd.get("positions")
             duration_ms = cmd.get("duration_ms")
             if not isinstance(positions, list) or len(positions) != len(SERVO_IDS):
@@ -146,7 +187,7 @@ def handle_client(conn: socket.socket) -> None:
             elif not isinstance(duration_ms, int):
                 conn.sendall(b'{"status": "error", "msg": "duration_ms must be an integer"}\n')
             else:
-                move_joints(positions, duration_ms)
+                move_joints_min_jerk(positions, duration_ms)
                 conn.sendall(b'{"status": "ok"}\n')
         elif cmd.get("cmd") == "read_positions":
             positions = read_all_positions()

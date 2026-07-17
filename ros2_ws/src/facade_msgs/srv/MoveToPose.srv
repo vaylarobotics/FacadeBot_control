@@ -1,0 +1,8 @@
+float64 x_m
+float64 y_m
+float64 z_m
+float64 tool_angle_deg   # tool pitch, degrees from horizontal, + = tilted up, in the arm's vertical reach-plane
+---
+bool success
+string message            # "ok", or a specific IK-failure reason (not reachable / which joint exceeds its range)
+float64[4] solved_angles_deg   # joint angles this target was solved to, base->end-effector order; only meaningful when success=true

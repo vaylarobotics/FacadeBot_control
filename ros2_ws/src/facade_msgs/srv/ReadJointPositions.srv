@@ -1,0 +1,3 @@
+---
+float64[4] positions_deg  # base -> end-effector order, matching SERVO_IDS; NaN for a joint with no reading
+bool all_valid             # false if any joint's reading was unavailable after retries

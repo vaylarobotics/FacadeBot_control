@@ -1,0 +1,8 @@
+facade_msgs/Waypoint[] waypoints
+---
+bool success
+string message
+uint32 waypoints_completed
+---
+uint32 current_waypoint_index
+uint32 total_waypoints

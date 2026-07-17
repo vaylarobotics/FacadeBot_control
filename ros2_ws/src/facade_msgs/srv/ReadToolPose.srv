@@ -1,0 +1,7 @@
+---
+bool success
+string message            # "ok", or why the pose couldn't be computed (esp32_bridge unreachable, read timed out, or a joint reading was unavailable)
+float64 x_m
+float64 y_m
+float64 z_m
+float64 tool_angle_deg

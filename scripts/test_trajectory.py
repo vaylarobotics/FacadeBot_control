@@ -2,8 +2,10 @@
 Stream a joint trajectory to the FacadeBot ESP32 over Wi-Fi/TCP.
 
 Each waypoint is sent as a move command and acknowledged before the next
-waypoint is sent. The script sleeps for duration_ms after each ack so the
-servos have time to reach the target before the next command arrives.
+waypoint is sent. The ESP32 shapes each move as a minimum-jerk trajectory
+internally and only acks once the servos have physically reached the target
+(see move_joints_min_jerk in esp32_firmware/main.py) - no extra wait is
+needed here before sending the next waypoint.
 
 Usage:
     python3 test_trajectory.py
@@ -13,28 +15,29 @@ import argparse
 import json
 import socket
 import sys
-import time
 
 ESP32_IP             = "192.168.1.100"  # must match STATIC_IP in esp32_firmware/main.py
 TCP_PORT             = 5000             # must match TCP_PORT in esp32_firmware/main.py
 RESPONSE_TIMEOUT_SEC = 10
 
-# Demonstration trajectory: slow sweep from home (500) toward a target pose and back.
-# Each row is [servo1, servo2, servo3, servo4, duration_ms].
-# Adjust these values to match your arm's safe range before running on hardware.
+# Demonstration trajectory: slow sweep from center (120°) toward a target pose and back.
+# Each row is [servo1_angle_deg, servo2_angle_deg, servo3_angle_deg, servo4_angle_deg, duration_ms].
+# Servo range is 0-240 degrees (LX-16A datasheet). Adjust these values to match
+# your arm's safe range before running on hardware.
 DEMO_TRAJECTORY = [
-    [500, 500, 500, 500, 1000],  # home
-    [520, 510, 490, 510,  400],
-    [540, 520, 480, 520,  400],
-    [560, 530, 470, 530,  400],
-    [580, 540, 460, 540,  400],
-    [600, 550, 450, 550,  400],
-    [580, 540, 460, 540,  400],
-    [560, 530, 470, 530,  400],
-    [540, 520, 480, 520,  400],
-    [520, 510, 490, 510,  400],
-    [500, 500, 500, 500, 1000],  # back to home
+    [120, 120, 120, 120, 1000],  # center
+    [120, 120, 120, 20, 1000],
+    [120, 120, 120, 220, 1000],
 ]
+
+_SERVO_ANGLE_MIN_DEG = 0.0  # must match esp32_bridge_node.py's copy of this constant
+_SERVO_ANGLE_MAX_DEG = 240.0
+_POSITION_MAX_RAW    = 1000  # must match _POSITION_MAX in esp32_firmware/main.py
+
+
+def _angle_deg_to_position_raw(angle_deg: float) -> int:
+    angle_deg_clamped = max(_SERVO_ANGLE_MIN_DEG, min(_SERVO_ANGLE_MAX_DEG, angle_deg))
+    return round(angle_deg_clamped * _POSITION_MAX_RAW / _SERVO_ANGLE_MAX_DEG)
 
 
 def send_command(f: "socket file", sock: socket.socket, payload: dict) -> dict:
@@ -73,12 +76,13 @@ def main() -> None:
     print(f"Sending trajectory ({len(DEMO_TRAJECTORY)} waypoints)...")
 
     for i, point in enumerate(DEMO_TRAJECTORY):
-        positions   = point[:4]
-        duration_ms = point[4]
+        angles_deg    = point[:4]
+        duration_ms   = point[4]
+        positions_raw = [_angle_deg_to_position_raw(a) for a in angles_deg]
 
         response = send_command(f, sock, {
             "cmd":         "move",
-            "positions":   positions,
+            "positions":   positions_raw,
             "duration_ms": duration_ms,
         })
 
@@ -87,8 +91,7 @@ def main() -> None:
             sock.close()
             sys.exit(1)
 
-        print(f"  waypoint {i+1}/{len(DEMO_TRAJECTORY)}: {positions} in {duration_ms}ms — ok")
-        time.sleep(duration_ms / 1000.0)
+        print(f"  waypoint {i+1}/{len(DEMO_TRAJECTORY)}: {angles_deg} deg in {duration_ms}ms — ok")
 
     sock.close()
     print("Trajectory complete.")
