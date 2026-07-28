@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'facade_control_node = facade_control.facade_control_node:main',
             'trajectory_node = facade_control.trajectory_node:main',
+            'continuous_trajectory_node = facade_control.continuous_trajectory_node:main',
         ],
     },
 )

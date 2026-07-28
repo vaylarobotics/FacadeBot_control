@@ -35,6 +35,19 @@ firmware changes, since this bridge must match it exactly.
   `main.py`) and only acks once that shaped move has physically finished, so
   the response now doubles as a "move complete" signal (see below).
 - Response: `{"status": "ok"}` or `{"status": "error", "msg": "..."}`.
+- `servo` command (continuous-motion streaming):
+  ```json
+  {"cmd": "servo", "positions": [p0, p1, p2, p3], "duration_ms": 120}
+  ```
+  Same `positions` format as `move` (4 raw counts, base → end-effector), but the
+  firmware moves **straight** toward the target with a single servo command and
+  acks **immediately** — no minimum-jerk shaping and no position readback (`servo`
+  branch of `handle_client` in `main.py`, reusing the plain `move_joints`). This is
+  the primitive continuous motion streams onto: the RPi sends `servo` setpoints
+  back-to-back (one per stream step) so each servo retargets before the previous
+  step finishes, giving motion that flows through waypoints instead of stopping.
+  `duration_ms` should be about one stream step so the servo's own interpolation
+  covers the gap. Response: `{"status": "ok"}` or `{"status": "error", "msg": "..."}`.
 - `read_positions` command:
   ```json
   {"cmd": "read_positions"}
@@ -70,6 +83,20 @@ pending real-hardware calibration.
 | Message type | `sensor_msgs/msg/JointState` (only `position`, in radians, is used) |
 | QoS | `ReliabilityPolicy.RELIABLE` (hardware command topic) |
 
+Forwarded as a `move` command (min-jerk shaping + fault readback).
+
+| | |
+|---|---|
+| Topic | `/facade_bot/joint_stream` |
+| Message type | `sensor_msgs/msg/JointState` (only `position`, in radians, is used) |
+| QoS | `ReliabilityPolicy.RELIABLE` (hardware command topic) |
+
+Continuous-motion setpoints from `continuous_trajectory_node`, forwarded as the
+non-blocking `servo` command. Bounds-checked exactly like `joint_cmd` (the
+mandatory gate applies to streamed setpoints too), but with **no** post-move
+fault readback and no per-setpoint logging — at the streaming rate that would
+flood the log and stall the stream.
+
 | | |
 |---|---|
 | Service | `/facade_bot/read_joint_positions` |
@@ -98,6 +125,7 @@ own constants):
 | `esp32_port` | `5000` | ESP32 TCP server port |
 | `esp32_timeout_sec` | `7.0` | Socket connect/response timeout (covers the ESP32 blocking a `move` ack until its shaped trajectory finishes, worst case ~5.12s) |
 | `move_duration_ms` | `1000` | Duration sent with every `move` command (`JointState` has no timing field) |
+| `servo_move_duration_ms` | `120` | Duration sent with every streamed `servo` setpoint; keep in step with `continuous_trajectory_node`'s `stream_period_sec` |
 
 ## Running
 

@@ -17,6 +17,7 @@ from facade_msgs.srv import ReadJointPositions
 _EXPECTED_SERVO_COUNT = 4
 
 _JOINT_CMD_TOPIC = "/facade_bot/joint_cmd"
+_JOINT_STREAM_TOPIC = "/facade_bot/joint_stream"  # continuous-motion setpoints (see continuous_trajectory_node)
 _QUEUE_DEPTH = 10  # small buffer - joint commands are infrequent, not a high-rate stream
 _READ_POSITIONS_SERVICE = "/facade_bot/read_joint_positions"
 
@@ -28,6 +29,10 @@ _DEFAULT_TIMEOUT_SEC = 7.0  # ESP32 now blocks the move ack until the shaped
                             # readback + 5000ms max duration_ms clamp ~= 5.12s.
                             # 7.0s leaves ~1.9s margin for Wi-Fi/TCP jitter.
 _DEFAULT_MOVE_DURATION_MS = 1000  # JointState has no timing field; this fills the ESP32's duration_ms
+# duration_ms sent with each streamed "servo" setpoint. Should be about one stream step
+# (continuous_trajectory_node's stream_period_sec, ~120ms) so the servo interpolates
+# smoothly to each setpoint over the gap before the next one arrives.
+_DEFAULT_SERVO_MOVE_DURATION_MS = 120
 
 # LX-16A datasheet: the 0-1000 raw position range spans the servo's full 0-240°
 # mechanical travel (0.24 deg per unit). This bridge is now the only place that
@@ -126,9 +131,14 @@ class Esp32BridgeNode(LifecycleNode):
         self.declare_parameter(
             "move_duration_ms", _DEFAULT_MOVE_DURATION_MS,
             ParameterDescriptor(description="milliseconds the ESP32 should take to reach each commanded pose"))
+        self.declare_parameter(
+            "servo_move_duration_ms", _DEFAULT_SERVO_MOVE_DURATION_MS,
+            ParameterDescriptor(description="milliseconds per streamed setpoint; keep in step with "
+                                            "continuous_trajectory_node's stream_period_sec"))
 
         self._transport: Esp32Transport | None = None
         self._subscription = None
+        self._stream_subscription = None
         self._service = None
 
     def on_configure(self, state: State) -> TransitionCallbackReturn:
@@ -161,6 +171,11 @@ class Esp32BridgeNode(LifecycleNode):
         )
         self.get_logger().info(f"listening on {_JOINT_CMD_TOPIC}")
 
+        self._stream_subscription = self.create_subscription(
+            JointState, _JOINT_STREAM_TOPIC, self._joint_stream_callback, qos
+        )
+        self.get_logger().info(f"listening on {_JOINT_STREAM_TOPIC}")
+
         self._service = self.create_service(
             ReadJointPositions, _READ_POSITIONS_SERVICE, self._handle_read_joint_positions
         )
@@ -171,6 +186,9 @@ class Esp32BridgeNode(LifecycleNode):
         if self._subscription is not None:
             self.destroy_subscription(self._subscription)
             self._subscription = None
+        if self._stream_subscription is not None:
+            self.destroy_subscription(self._stream_subscription)
+            self._stream_subscription = None
         if self._service is not None:
             self.destroy_service(self._service)
             self._service = None
@@ -186,6 +204,9 @@ class Esp32BridgeNode(LifecycleNode):
         if self._subscription is not None:
             self.destroy_subscription(self._subscription)
             self._subscription = None
+        if self._stream_subscription is not None:
+            self.destroy_subscription(self._stream_subscription)
+            self._stream_subscription = None
         if self._service is not None:
             self.destroy_service(self._service)
             self._service = None
@@ -224,6 +245,38 @@ class Esp32BridgeNode(LifecycleNode):
         else:
             self.get_logger().info(f"sent {angles_deg} deg, ESP32 ack ok")
             self._check_move_completed(target_positions_raw, angles_deg)
+
+    def _joint_stream_callback(self, msg: JointState) -> None:
+        angles_deg = [math.degrees(p) for p in msg.position]
+        if len(angles_deg) != _EXPECTED_SERVO_COUNT:
+            self.get_logger().warn(
+                f"expected {_EXPECTED_SERVO_COUNT} stream positions, got {len(angles_deg)} - ignoring"
+            )
+            return
+        self._send_servo_command(angles_deg)
+
+    def _send_servo_command(self, angles_deg: list[float]) -> None:
+        # Streaming setpoint path: the same mandatory bounds-check applies, but this
+        # uses the ESP32's non-blocking "servo" command (no min-jerk shaping, no
+        # position readback) so setpoints can flow back-to-back for continuous motion.
+        # No per-setpoint info logging - at the streaming rate it would flood the log.
+        violations = _check_joint_bounds(angles_deg)
+        if violations:
+            self.get_logger().error("stream setpoint rejected - out of bounds: " + "; ".join(violations))
+            return
+
+        duration_ms = self.get_parameter("servo_move_duration_ms").value
+        target_positions_raw = [_angle_deg_to_position_raw(a, i) for i, a in enumerate(angles_deg)]
+        command = {"cmd": "servo", "positions": target_positions_raw, "duration_ms": duration_ms}
+        try:
+            self._transport.send_command(command)
+            response = self._transport.read_response()
+        except Esp32TransportError as exc:
+            self.get_logger().warn(f"ESP32 servo command failed: {exc}")
+            return
+
+        if response.get("status") != "ok":
+            self.get_logger().warn(f"ESP32 rejected servo command: {response}")
 
     def _read_positions_with_retry(self) -> list[int | None]:
         merged_positions_raw: list[int | None] = [None] * _EXPECTED_SERVO_COUNT

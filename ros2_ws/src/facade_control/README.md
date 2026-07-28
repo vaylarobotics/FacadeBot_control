@@ -172,16 +172,11 @@ to the next waypoint. Feedback reports `current_waypoint_index`/
 actually confirmed-reached, useful for telling how far a failed/canceled
 run got).
 
-**V1 stops fully at each waypoint** - there's no blending/continuous motion
-between points yet. The user's stated goal is eventually sweeping a
-rectangular area, which will need continuous blending through a dense
-waypoint sequence rather than stop-and-go; that needs new ESP32
-firmware/protocol support (today's `move_joints_min_jerk` is a single
-blocking point-to-point primitive with no notion of a queued next segment),
-not just a ROS2-side change, and is tracked as future work. The action's
-Goal/Feedback/Result shape here is designed to not need to change when that
-lands - only the internal "wait for this waypoint to be confirmed
-physically reached" step is expected to be replaced.
+**`trajectory_node` stops fully at each waypoint** - it's for precise
+point-to-point positioning. For continuous motion that flows through the
+waypoints at a steady speed (e.g. sweeping a surface), use
+`continuous_trajectory_node` below instead; the two are separate nodes with
+separate actions and both remain available.
 
 **Cancellation caveat**: canceling a goal stops `trajectory_node` from
 commanding any *further* waypoints - it does not stop the arm mid-move.
@@ -189,6 +184,64 @@ There's no firmware/protocol primitive to abort an in-flight physical move,
 and emergency-stop logic is still not implemented (see the top-level
 `CLAUDE.md`). If a cancel arrives while waiting on a waypoint, the arm
 still physically finishes whatever move was already commanded.
+
+## Following a trajectory continuously
+
+`continuous_trajectory_node` (a third node in this package) sweeps the tool
+tip through the waypoints at a **constant Cartesian speed**, rounding corners
+rather than stopping at each point - for even coverage when painting or
+cleaning a surface.
+
+| | |
+|---|---|
+| Action | `/facade_bot/follow_trajectory_continuous` |
+| Action type | `facade_msgs/action/FollowTrajectoryContinuous` |
+
+```bash
+ros2 run facade_control continuous_trajectory_node
+```
+
+```bash
+ros2 action send_goal /facade_bot/follow_trajectory_continuous facade_msgs/action/FollowTrajectoryContinuous \
+  "{waypoints: [{x_m: 0.20, y_m: -0.05, z_m: 0.20, tool_angle_deg: 0.0}, {x_m: 0.20, y_m: 0.0, z_m: 0.20, tool_angle_deg: 0.0}, {x_m: 0.20, y_m: 0.05, z_m: 0.20, tool_angle_deg: 0.0}], tool_speed_mmps: 30.0, corner_blend_m: 0.02}" \
+  --feedback
+```
+
+The Goal adds `tool_speed_mmps` (constant tool-tip speed) and `corner_blend_m`
+(how far from each interior waypoint the path is allowed to curve; `0` means
+sharp corners). The whole motion is planned and validated **before any
+movement**: it builds a corner-rounded Cartesian path
+(`trajectory_planning.build_blended_path`), samples it at the requested speed
+with a smooth speed-up/slow-down at the ends
+(`sample_at_constant_speed`), and solves every sample to joint angles with
+chained IK so the elbow configuration stays continuous
+(`solve_path_to_setpoints`). If any point on the path is unreachable or
+out-of-range, the goal is aborted before the arm moves. It then streams the
+joint setpoints to `/facade_bot/joint_stream` (which `esp32_bridge` forwards
+as the non-blocking `servo` command), paced by the `stream_period_sec`
+parameter. Feedback reports `fraction_complete` (0.0-1.0); the result reports
+`success`, `message`, and `fraction_completed`.
+
+**Why round corners:** true constant speed and sharp corners are physically
+incompatible (an instant direction change needs infinite acceleration), so the
+path curves within `corner_blend_m` of each interior waypoint instead of
+passing exactly through it. Straight/collinear runs stay straight, so a
+raster's parallel passes are unaffected and only the U-turns get rounded.
+
+**Constraints and tuning:**
+- `stream_period_sec` (default 0.12 s) must stay `>=` the rate `esp32_bridge` +
+  the servo bus can actually forward (~80 ms to write all 4 servos at the
+  current inter-servo delay, ~12 Hz), and should match `esp32_bridge`'s
+  `servo_move_duration_ms`. Streaming faster backs up the topic queue and makes
+  the arm lag the plan.
+- Wi-Fi jitter on the streamed setpoints causes small velocity ripple.
+- Corner acceleration is roughly `speed^2 / corner_blend_m`; very tight corners
+  at high speed may need a lower speed. Curvature-based corner speed-limiting is
+  future work.
+
+**Cancellation caveat** is the same as `trajectory_node`'s: canceling stops
+further setpoints, but the arm coasts to the last one already commanded - there
+is no e-stop primitive.
 
 ## Known limitations
 

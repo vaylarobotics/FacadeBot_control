@@ -1,0 +1,14 @@
+# Goal: sweep the tool tip through these waypoints at a constant speed, rounding
+# corners rather than stopping at each one (see facade_control/README.md).
+facade_msgs/Waypoint[] waypoints
+float64 tool_speed_mmps      # constant tool-tip speed along the path, millimetres per second
+float64 corner_blend_m       # corner-rounding radius in metres; the path curves within this
+                             # distance of each interior waypoint instead of passing through it
+---
+# Result
+bool success
+string message
+float64 fraction_completed   # 0.0-1.0 portion of the path actually executed before finishing/aborting
+---
+# Feedback
+float64 fraction_complete    # 0.0-1.0 progress along the path

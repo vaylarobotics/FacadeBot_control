@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ReadToolPose.srv"
   "msg/Waypoint.msg"
   "action/FollowTrajectory.action"
+  "action/FollowTrajectoryContinuous.action"
   DEPENDENCIES action_msgs
 )
 

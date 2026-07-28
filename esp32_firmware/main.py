@@ -189,6 +189,22 @@ def handle_client(conn: socket.socket) -> None:
             else:
                 move_joints_min_jerk(positions, duration_ms)
                 conn.sendall(b'{"status": "ok"}\n')
+        elif cmd.get("cmd") == "servo":
+            # Streaming setpoint: move straight toward the target and ack right
+            # away, WITHOUT the min-jerk shaping or position readback that "move"
+            # does. The RPi sends these back-to-back (one per stream step) so each
+            # servo retargets before the previous step finishes, giving continuous
+            # motion with no stop at intermediate points. duration_ms should be
+            # about one stream step so the servo's own interpolation covers the gap.
+            positions = cmd.get("positions")
+            duration_ms = cmd.get("duration_ms")
+            if not isinstance(positions, list) or len(positions) != len(SERVO_IDS):
+                conn.sendall(b'{"status": "error", "msg": "positions must be a list with one value per servo"}\n')
+            elif not isinstance(duration_ms, int):
+                conn.sendall(b'{"status": "error", "msg": "duration_ms must be an integer"}\n')
+            else:
+                move_joints(positions, duration_ms)
+                conn.sendall(b'{"status": "ok"}\n')
         elif cmd.get("cmd") == "read_positions":
             positions = read_all_positions()
             conn.sendall(json.dumps({"status": "ok", "positions": positions}).encode() + b'\n')

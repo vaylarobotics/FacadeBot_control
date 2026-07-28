@@ -155,6 +155,28 @@ mid-move (no e-stop primitive exists yet). See
 `ros2_ws/src/facade_control/README.md`'s "Following a trajectory" section
 for the feedback/result fields and known limitations.
 
+## 12. Sweep through waypoints continuously at constant speed (optional, needs steps 5–8 already running)
+
+```bash
+ros2 run facade_control continuous_trajectory_node
+```
+
+Then, in another sourced terminal:
+```bash
+ros2 action send_goal /facade_bot/follow_trajectory_continuous facade_msgs/action/FollowTrajectoryContinuous \
+  "{waypoints: [{x_m: 0.20, y_m: -0.05, z_m: 0.20, tool_angle_deg: 0.0}, {x_m: 0.20, y_m: 0.0, z_m: 0.20, tool_angle_deg: 0.0}, {x_m: 0.20, y_m: 0.05, z_m: 0.20, tool_angle_deg: 0.0}], tool_speed_mmps: 30.0, corner_blend_m: 0.02}" \
+  --feedback
+```
+
+Unlike step 11, the tool tip flows through the waypoints at a constant speed
+(`tool_speed_mmps`) without stopping, rounding each corner within
+`corner_blend_m` instead of passing exactly through it. The whole path is
+planned and checked for reachability **before** any motion, then streamed to
+the arm. Start with a low speed on hardware. Cancellation and the no-e-stop
+caveat are the same as step 11. See
+`ros2_ws/src/facade_control/README.md`'s "Following a trajectory continuously"
+section for the goal fields, tuning, and constraints.
+
 ## Shutting down
 
 ```bash
@@ -172,6 +194,10 @@ ESP32 connection either way.
   auto-update.
 - **`configure` fails / can't connect to ESP32**: confirm `ping 192.168.1.100` works first: it
   isolates the problem to Wi-Fi/wiring vs. ROS2.
-- **Moves stopped working after a firmware change**: the `move` wire format must match on both
-  sides — if you edited `esp32_bridge_node.py`'s protocol without reflashing the ESP32 (or vice
-  versa), reflash per step 1.
+- **Moves stopped working after a firmware change**: the `move`/`servo` wire format must match on
+  both sides — if you edited `esp32_bridge_node.py`'s protocol without reflashing the ESP32 (or
+  vice versa), reflash per step 1.
+- **Continuous sweep is jerky or lags the plan**: `continuous_trajectory_node`'s
+  `stream_period_sec` and `esp32_bridge_node`'s `servo_move_duration_ms` should match, and neither
+  should be faster than the servo bus can keep up with (~12 Hz). Raise both (slower stream) if the
+  arm can't follow.
