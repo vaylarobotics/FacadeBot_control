@@ -1,0 +1,19 @@
+# vcstool import file for the Camera Module 3 vision workspace (~/camera_ws).
+#
+# Pins the exact commits the working build on `harthikpi` was verified against.
+# Usage on a fresh Pi:
+#   mkdir -p ~/camera_ws/src && cd ~/camera_ws
+#   vcs import src < /path/to/camera_ws.repos
+# Then run scripts/setup_camera.sh (which skips its own clone step if these exist).
+#
+# NOTE: libcamera is the Raspberry Pi FORK, not upstream — it carries the
+# imx708 (Camera Module 3) sensor support that camera_ros is built against.
+repositories:
+  libcamera:
+    type: git
+    url: https://github.com/raspberrypi/libcamera.git
+    version: 26bfadc6
+  camera_ros:
+    type: git
+    url: https://github.com/christianrauch/camera_ros.git
+    version: 03c9e03

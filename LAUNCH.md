@@ -4,6 +4,33 @@ Steps and commands to get the arm from powered-off to accepting joint commands.
 Run the RPi/ROS2 steps on the Raspberry Pi; the ESP32 flashing step can be run
 from whichever machine has the ESP32 plugged in over USB.
 
+## 0. Network addressing (reference)
+
+Both the RPi and the ESP32 hold static IPs — nothing here is handed out by DHCP,
+so these addresses are the same on every boot.
+
+| Device | Address | Where it's set |
+|--------|---------|----------------|
+| RPi (wlan0) | `192.168.1.17` | NetworkManager profiles `TP-Link_08F3` and `Airtel_hart_5833`, both `ipv4.method manual` |
+| ESP32 | `192.168.1.100` | `STATIC_IP` in `esp32_firmware/main.py` |
+| Gateway | `192.168.1.1` | Both networks use `192.168.1.0/24` |
+
+`TP-Link_08F3` is the network the RPi↔ESP32 link runs on — the ESP32 firmware
+joins that SSID. The RPi keeps `192.168.1.17` on the Airtel network too, so SSH
+is the same command either way:
+
+```bash
+ssh harthik@192.168.1.17
+```
+
+To put the RPi on the ESP32's network (do this from a monitor/keyboard on the Pi
+— it drops any SSH session running over the other network):
+
+```bash
+sudo nmcli con up TP-Link_08F3
+ip -4 -brief addr show wlan0   # expect 192.168.1.17/24
+```
+
 ## 1. Flash the ESP32 (only needed after `esp32_firmware/main.py` changes)
 
 The board needs to be connected over USB for this step — Wi-Fi isn't up yet
@@ -177,6 +204,31 @@ caveat are the same as step 11. See
 `ros2_ws/src/facade_control/README.md`'s "Following a trajectory continuously"
 section for the goal fields, tuning, and constraints.
 
+## 13. Start the camera (optional, separate `~/camera_ws` — RPi only)
+
+The Camera Module 3 driver (`camera_ros` built against the Raspberry Pi fork of
+libcamera) lives in its own workspace, `~/camera_ws`, **not** the main
+`ros2_ws`. To rebuild it from scratch on a fresh Pi, run
+`scripts/setup_camera.sh` (pins are in `camera_ws.repos`).
+
+Source it *in addition to* the main workspace (order matters — overlay the
+camera ws, then the main ws):
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/harthik/camera_ws/install/setup.bash
+source /home/harthik/FacadeBot_control/ros2_ws/install/setup.bash
+```
+
+Then start the camera node:
+```bash
+ros2 run camera_ros camera_node --ros-args -p orientation:=180 -p width:=800 -p height:=600
+```
+
+It publishes image topics that a future `facade_vision` node will subscribe to.
+Confirm it's alive with `ros2 topic list | grep -i image` in another sourced
+terminal. `orientation:=180` flips the image for the arm's mounting; drop it if
+the camera is mounted upright.
+
 ## Shutting down
 
 ```bash
@@ -193,7 +245,16 @@ ESP32 connection either way.
   installed copy under `ros2_ws/install/` is a separate copy from `ros2_ws/src/`, it doesn't
   auto-update.
 - **`configure` fails / can't connect to ESP32**: confirm `ping 192.168.1.100` works first: it
-  isolates the problem to Wi-Fi/wiring vs. ROS2.
+  isolates the problem to Wi-Fi/wiring vs. ROS2. If the ping fails, check the RPi is actually on
+  the ESP32's network (`nmcli -t -f NAME,DEVICE con show --active` should show `TP-Link_08F3`) —
+  it can't reach the ESP32 from the Airtel network. See step 0.
+- **Can't SSH to the RPi / don't know its IP**: it's static at `192.168.1.17` on both networks
+  (step 0), but you must be on the same network as it. To find it after a network change, sweep
+  the subnet from another machine — the RPi's MAC starts `2c:cf:67` (Raspberry Pi Ltd):
+  ```bash
+  nmap -sn 192.168.1.0/24 && ip neigh show
+  ```
+  `harthikpi.local` is unreliable — mDNS resolution isn't installed on every machine.
 - **Moves stopped working after a firmware change**: the `move`/`servo` wire format must match on
   both sides — if you edited `esp32_bridge_node.py`'s protocol without reflashing the ESP32 (or
   vice versa), reflash per step 1.
