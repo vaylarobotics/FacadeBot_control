@@ -8,6 +8,7 @@ from sensor_msgs.msg import JointState
 
 from facade_control import kinematics
 from facade_msgs.srv import MoveToPose, ReadJointPositions, ReadToolPose
+from facadebot_description import robot_model
 
 _JOINT_CMD_TOPIC = "/facade_bot/joint_cmd"
 _QUEUE_DEPTH = 10  # matches esp32_bridge_node's subscription - joint commands are infrequent
@@ -35,6 +36,12 @@ class FacadeControlNode(Node):
 
     def __init__(self) -> None:
         super().__init__("facade_control_node")
+
+        # Solving anything before this succeeds would mean solving against
+        # whichever arm the code last had hardcoded, so it happens first and a
+        # failure takes the node down rather than being logged and ignored.
+        model = kinematics.load_active_model()
+        self.get_logger().info(robot_model.describe(model))
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -170,7 +177,12 @@ class FacadeControlNode(Node):
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
-    node = FacadeControlNode()
+    try:
+        node = FacadeControlNode()
+    except robot_model.RobotModelError as error:
+        print(f"facade_control_node: refusing to start: {error}")
+        rclpy.shutdown()
+        raise SystemExit(1)
     try:
         rclpy.spin(node)
     finally:

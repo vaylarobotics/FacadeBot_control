@@ -1,0 +1,76 @@
+# Which arm the control stack is allowed to drive, and the numbers that were
+# measured on the hardware rather than exported from CAD.
+#
+# Link lengths, joint origins and joint axes are NOT here. They are baked out of
+# the SolidWorks URDF once by scripts/generate_geometry.py into the geometry_*
+# files named below, so the CAD export stays the single source of truth for
+# geometry without every node having to re-parse a URDF at startup. Nothing that
+# runs on the arm opens a URDF at all.
+#
+# After re-exporting a URDF from SolidWorks:
+#   python3 scripts/generate_geometry.py --model <name>
+# then re-check the limits and tool offset below against the new geometry, and
+# commit the regenerated geometry file in the SAME COMMIT as any change here.
+#
+# limits_source records where each model's hand-measured numbers came from. Only
+# the literal value "measured" is trusted; anything else makes every node print a
+# warning banner at startup (see robot_model.py's describe()). It is a warning
+# rather than a refusal because bench bring-up has to move the arm before the arm
+# can be measured - but placeholder numbers must never pass for real ones.
+
+active_model: v2
+
+models:
+
+  # Retired arm. Kept so the old model stays loadable in RViz and so the
+  # commit history has something to diff against. Do not select as
+  # active_model - the physical arm it describes no longer exists.
+  v1:
+    # urdf_file is read only by scripts/generate_geometry.py, never at runtime.
+    urdf_file: urdf/URDF_Test.urdf
+    geometry_file: config/geometry_v1.yaml
+
+    limits_source: measured
+
+    # Straight-line offset from joint_4 to the tool tip, in link_4's frame.
+    # Not in the URDF - measured on the hardware. On v1 the tool lay along
+    # link_4's +x, which was the reach direction.
+    tool_tip_offset_m: [0.05, 0.0, 0.0]
+
+    # Measured on the physical v1 arm, relative to each joint's own calibrated
+    # centre (see esp32_bridge_node.py's _JOINT_CENTER_RAD). NOT the URDF's
+    # <limit> tags, which were a nominal 0-240 deg servo range.
+    joint_limits_deg:
+      joint_1: [-110.0, 110.0]
+      joint_2: [-110.0, 110.0]
+      joint_3: [-110.0, 110.0]
+      joint_4: [-100.0, 100.0]   # narrower, measured
+
+  # Current arm. URDF_V2 declares all four joints `continuous` with no <limit>
+  # tags at all, so nothing below can be recovered from the URDF - it has to be
+  # measured on the rebuilt hardware.
+  #
+  # joint_limits_deg and tool_tip_offset_m have both been re-measured on the
+  # rebuilt v2 arm (2026-09-16).
+  v2:
+    urdf_file: urdf/URDF_V2.urdf
+    geometry_file: config/geometry_v2.yaml
+
+    limits_source: measured
+
+    # Measured on the rebuilt v2 arm (2026-09-16): confirmed the tool tip still
+    # lies on link_4's local x-axis (no y/z offset), just shorter than the
+    # earlier guess. Despite joint_4's axis moving out of the joint_2/joint_3
+    # plane, the tool mount itself sits along local x, same as v1's layout.
+    tool_tip_offset_m: [0.06, 0.0, 0.0]
+
+    # Re-measured on the rebuilt v2 arm (2026-09-16), relative to each joint's
+    # calibrated centre in esp32_bridge_node.py's _JOINT_CENTER_RAD (also
+    # re-checked on v2 and found unchanged from v1). joints 1-3 came out the
+    # same as v1's travel; joint_4's mechanical range is wider on the rebuilt
+    # arm.
+    joint_limits_deg:
+      joint_1: [-110.0, 110.0]
+      joint_2: [-110.0, 110.0]
+      joint_3: [-110.0, 110.0]
+      joint_4: [-110.0, 110.0]

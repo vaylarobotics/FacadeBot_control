@@ -1,0 +1,45 @@
+# GENERATED FILE - DO NOT EDIT BY HAND.
+#
+# Written by scripts/generate_geometry.py from the URDF named below. Every number
+# here came out of the SolidWorks export, so hand-editing this file makes the
+# controller disagree with the CAD model and with the physical arm.
+#
+# To change it: re-export the URDF, then re-run
+#     python3 scripts/generate_geometry.py --model v1
+# and commit both files together.
+#
+# Measured values (joint limits, tool-tip offset) are NOT here - they live in
+# robot_model.yaml, which is hand-written.
+
+
+model: v1
+source_urdf: urdf/URDF_Test.urdf
+source_urdf_sha256: "3716fd0a8347cfa91fa95db88df470e08635ab3b4408b2ece615b66853d4ae5a"
+root_link: base_link
+
+# Ordered base to tip. The solver relies on this order.
+joints:
+  - name: joint_1
+    parent_link: base_link
+    child_link: link_1
+    origin_xyz_m: [0.0, 0.0, 0.10061]
+    origin_rpy_rad: [0.0, 0.0, 0.0]
+    axis: [0.0, 0.0, 1.0]
+  - name: joint_2
+    parent_link: link_1
+    child_link: link_2
+    origin_xyz_m: [0.0, 0.0, 0.0]
+    origin_rpy_rad: [1.5708, -1.5708, 0.0]
+    axis: [0.0, 0.0, 1.0]
+  - name: joint_3
+    parent_link: link_2
+    child_link: link_3
+    origin_xyz_m: [0.12511, 0.0, 0.0]
+    origin_rpy_rad: [0.0, 0.0, 0.0]
+    axis: [0.0, 0.0, 1.0]
+  - name: joint_4
+    parent_link: link_3
+    child_link: link_4
+    origin_xyz_m: [0.16511, 0.0, 0.0]
+    origin_rpy_rad: [0.0, 0.0, 0.0]
+    axis: [0.0, 0.0, 1.0]

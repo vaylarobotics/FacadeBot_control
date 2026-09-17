@@ -89,7 +89,7 @@ def test_plan_joint_setpoints_on_reachable_waypoints_stay_in_limits():
     assert len(setpoints) >= 2
     for setpoint in setpoints:
         assert len(setpoint) == 4
-        for angle_deg, (lower, upper) in zip(setpoint, kinematics._JOINT_LIMITS_DEG):
+        for angle_deg, (lower, upper) in zip(setpoint, kinematics.joint_limits_deg()):
             assert lower - 1e-6 <= angle_deg <= upper + 1e-6
     # First setpoint should recover the seed angles it was solved from.
     assert setpoints[0] == pytest.approx(seed, abs=1.0)

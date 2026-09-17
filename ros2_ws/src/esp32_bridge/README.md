@@ -116,6 +116,26 @@ Response is `positions_deg` (4 floats, base → end-effector, `NaN` for any
 joint with no reading) and `all_valid` (`false` if any joint's reading was
 unavailable after retries).
 
+| | |
+|---|---|
+| Service | `/facade_bot/read_joint_positions_fast` |
+| Service type | `facade_msgs/srv/ReadJointPositions` (same message as above) |
+
+Same request/response shape as `read_joint_positions`, but a single attempt
+with no retries — measured on the arm at ~170ms rather than the plain
+service's occasional 600ms+ (waiting out the full retry budget for one slow
+joint). About half of single attempts are missing one joint (`all_valid:
+false`, that joint `NaN`); this is normal for this service, not a fault, and
+callers should treat a miss as "use the last known value," not an error.
+**Not a substitute for `read_joint_positions`** in anything safety-relevant —
+`esp32_bridge_node`'s own move-fault check still uses the full-retry version.
+Intended for a caller that polls continuously and can tolerate one joint
+being one poll cycle stale (e.g. a `/joint_states` publisher for RViz).
+
+```bash
+ros2 service call /facade_bot/read_joint_positions_fast facade_msgs/srv/ReadJointPositions {}
+```
+
 Parameters (all overridable at launch, defaults match the ESP32 firmware's
 own constants):
 

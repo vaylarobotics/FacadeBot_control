@@ -3,22 +3,22 @@
      Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
      For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
 <robot
-  name="URDF_Test">
+  name="URDF_V2">
   <link
     name="base_link">
     <inertial>
       <origin
-        xyz="-0.000302498356542271 -1.23584683103812E-18 0.0208037512058042"
+        xyz="6.5506E-05 0.0015009 0.020472"
         rpy="0 0 0" />
       <mass
-        value="0.185876111089366" />
+        value="0.20537" />
       <inertia
-        ixx="0.00011010087282028"
-        ixy="1.53067673691777E-21"
-        ixz="7.0505117282052E-07"
-        iyy="0.000108602448964458"
-        iyz="-5.14659234073944E-21"
-        izz="0.000144532871613693" />
+        ixx="0.0001168"
+        ixy="-1.3436E-21"
+        ixz="-7.2685E-21"
+        iyy="0.00013342"
+        iyz="-2.2758E-06"
+        izz="0.00017603" />
     </inertial>
     <visual>
       <origin
@@ -26,12 +26,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/base_link.STL" />
+          filename="package://facadebot_description/meshes/v2/base_link.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -40,7 +40,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/base_link.STL" />
+          filename="package://facadebot_description/meshes/v2/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -48,17 +48,17 @@
     name="link_1">
     <inertial>
       <origin
-        xyz="-1.08593950645835E-14 4.90081785327976E-05 -0.0307873139845405"
+        xyz="-1.7923E-05 -4.4959E-05 0.026896"
         rpy="0 0 0" />
       <mass
-        value="0.0864426238517261" />
+        value="0.10742" />
       <inertia
-        ixx="4.57244575317583E-05"
-        ixy="-4.60315219200976E-20"
-        ixz="-1.18716155113592E-17"
-        iyy="4.38885234387799E-05"
-        iyz="-5.98997737307958E-08"
-        izz="2.42270894458425E-05" />
+        ixx="3.0472E-05"
+        ixy="-2.5011E-22"
+        ixz="-1.6625E-07"
+        iyy="3.1459E-05"
+        iyz="-3.8538E-22"
+        izz="4.467E-05" />
     </inertial>
     <visual>
       <origin
@@ -66,12 +66,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_1.STL" />
+          filename="package://facadebot_description/meshes/v2/link_1.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -80,43 +80,38 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_1.STL" />
+          filename="package://facadebot_description/meshes/v2/link_1.STL" />
       </geometry>
     </collision>
   </link>
   <joint
     name="joint_1"
-    type="revolute">
+    type="continuous">
     <origin
-      xyz="0 0 0.10061"
+      xyz="0.00039 0.00089 0.0403"
       rpy="0 0 0" />
     <parent
       link="base_link" />
     <child
       link="link_1" />
     <axis
-      xyz="0 0 1" />
-    <limit
-      lower="0.0"
-      upper="4.18878"
-      effort="0"
-      velocity="0" />
+      xyz="0 0 -1" />
   </joint>
   <link
     name="link_2">
     <inertial>
       <origin
-        xyz="0.0728262929766277 -5.45943706052417E-15 0.000104904291739992"
+        xyz="0.075359 -3.7896E-05 4.2545E-05"
         rpy="0 0 0" />
       <mass
-        value="0.114185703128181" />
+        value="0.12744" />
       <inertia
-        ixx="2.15250892950697E-05"
-        ixy="6.86730216495295E-18"
-        ixz="-1.66727593232302E-09"
-        iyy="0.000150157013572169"
-        iyz="4.21419168766168E-21"
-        izz="0.000140293587835883" />
+        ixx="2.5339E-05"
+        ixy="-3.5405E-21"
+        ixz="1.4271E-07"
+        iyy="8.5738E-05"
+        iyz="-1.7196E-20"
+        izz="7.3468E-05" />
     </inertial>
     <visual>
       <origin
@@ -124,12 +119,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_2.STL" />
+          filename="package://facadebot_description/meshes/v2/link_2.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -138,43 +133,38 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_2.STL" />
+          filename="package://facadebot_description/meshes/v2/link_2.STL" />
       </geometry>
     </collision>
   </link>
   <joint
     name="joint_2"
-    type="revolute">
+    type="continuous">
     <origin
-      xyz="0 0 0"
-      rpy="1.5708 -1.5708 0" />
+      xyz="0 -0.00014 0.06111"
+      rpy="0 -1.5708 0" />
     <parent
       link="link_1" />
     <child
       link="link_2" />
     <axis
       xyz="0 0 1" />
-    <limit
-      lower="0.0"
-      upper="4.18878"
-      effort="0"
-      velocity="0" />
   </joint>
   <link
     name="link_3">
     <inertial>
       <origin
-        xyz="0.0924788850542768 1.80247217713937E-17 9.641452458257E-05"
+        xyz="0.078062 -1.9266E-05 -0.00017825"
         rpy="0 0 0" />
       <mass
-        value="0.156185703128181" />
+        value="0.13481" />
       <inertia
-        ixx="2.98865900336068E-05"
-        ixy="-4.23455820788E-19"
-        ixz="1.30618243691618E-08"
-        iyy="0.000340981006019197"
-        iyz="-1.30520889168701E-20"
-        izz="0.000327131079544374" />
+        ixx="2.7111E-05"
+        ixy="1.7533E-07"
+        ixz="3.1947E-07"
+        iyy="9.833E-05"
+        iyz="-5.1621E-10"
+        izz="8.9024E-05" />
     </inertial>
     <visual>
       <origin
@@ -182,12 +172,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_3.STL" />
+          filename="package://facadebot_description/meshes/v2/link_3.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -196,15 +186,15 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_3.STL" />
+          filename="package://facadebot_description/meshes/v2/link_3.STL" />
       </geometry>
     </collision>
   </link>
   <joint
     name="joint_3"
-    type="revolute">
+    type="continuous">
     <origin
-      xyz="0.12511 0 0"
+      xyz="0.13511 -0.00014 0"
       rpy="0 0 0" />
     <parent
       link="link_2" />
@@ -212,27 +202,22 @@
       link="link_3" />
     <axis
       xyz="0 0 1" />
-    <limit
-      lower="0.0"
-      upper="4.18878"
-      effort="0"
-      velocity="0" />
   </joint>
   <link
     name="link_4">
     <inertial>
       <origin
-        xyz="0.032402408261025 7.93901043351227E-19 0.000100000000005871"
+        xyz="0.027076 2.3636E-17 -0.0001"
         rpy="0 0 0" />
       <mass
-        value="0.0427573671532661" />
+        value="0.034066" />
       <inertia
-        ixx="9.43309438811531E-06"
-        ixy="-4.73295404440121E-22"
-        ixz="-2.44886644333843E-21"
-        iyy="1.34865728829471E-05"
-        iyz="-1.91361348789138E-22"
-        izz="8.475668637014E-06" />
+        ixx="7.4962E-06"
+        ixy="-9.5984E-22"
+        ixz="1.6078E-21"
+        iyy="1.0975E-05"
+        iyz="1.8049E-21"
+        izz="6.9793E-06" />
     </inertial>
     <visual>
       <origin
@@ -240,12 +225,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_4.STL" />
+          filename="package://facadebot_description/meshes/v2/link_4.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="0.79216 0.81961 0.93333 1" />
       </material>
     </visual>
     <collision>
@@ -254,26 +239,21 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://facadebot_description/meshes/v1/link_4.STL" />
+          filename="package://facadebot_description/meshes/v2/link_4.STL" />
       </geometry>
     </collision>
   </link>
   <joint
     name="joint_4"
-    type="revolute">
+    type="continuous">
     <origin
-      xyz="0.16511 0 0"
-      rpy="0 0 0" />
+      xyz="0.14011 0 -0.00076"
+      rpy="-1.5708 0 0" />
     <parent
       link="link_3" />
     <child
       link="link_4" />
     <axis
       xyz="0 0 1" />
-    <limit
-      lower="0.22"
-      upper="4.0"
-      effort="0"
-      velocity="0" />
   </joint>
 </robot>

@@ -1,3 +1,5 @@
+import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'facade_control'
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob.glob('launch/*.launch.py')),
+        ('share/' + package_name + '/rviz', glob.glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,6 +31,7 @@ setup(
             'facade_control_node = facade_control.facade_control_node:main',
             'trajectory_node = facade_control.trajectory_node:main',
             'continuous_trajectory_node = facade_control.continuous_trajectory_node:main',
+            'joint_state_publisher_node = facade_control.joint_state_publisher_node:main',
         ],
     },
 )

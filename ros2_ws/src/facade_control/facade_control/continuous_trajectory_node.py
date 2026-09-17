@@ -12,6 +12,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 
 from facade_control import kinematics, trajectory_planning
+from facadebot_description import robot_model
 from facade_msgs.action import FollowTrajectoryContinuous
 from facade_msgs.srv import ReadJointPositions
 
@@ -225,7 +226,14 @@ class ContinuousTrajectoryNode(Node):
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
+    try:
+        model = kinematics.load_active_model()
+    except robot_model.RobotModelError as error:
+        print(f"continuous_trajectory_node: refusing to start: {error}")
+        rclpy.shutdown()
+        raise SystemExit(1)
     node = ContinuousTrajectoryNode()
+    node.get_logger().info(robot_model.describe(model))
     executor = MultiThreadedExecutor(num_threads=_EXECUTOR_THREAD_COUNT)
     executor.add_node(node)
     try:

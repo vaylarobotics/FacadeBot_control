@@ -6,9 +6,9 @@ from machine import UART, Pin
 
 # ── Wi-Fi and TCP configuration ───────────────────────────────────────────────
 # Fill in your network credentials and router gateway before flashing.
-WIFI_SSID        = "TP-Link_08F3"       # replace with your network name
+WIFI_SSID        = "Airtel_hart_5833"       # replace with your network name
 WIFI_PASSWORD    = "16288935"   # replace with your network password
-STATIC_IP        = "192.168.1.100"        # fixed IP the ESP32 will claim — pick one
+STATIC_IP        = "192.168.1.150"        # fixed IP the ESP32 will claim — pick one
                                            # not already in use on your network
 SUBNET_MASK      = "255.255.255.0"
 GATEWAY          = "192.168.1.1"          # your router's IP — run `ip route` on RPi to confirm
@@ -156,6 +156,10 @@ def move_joints_min_jerk(positions: list, duration_ms: int) -> None:
 def connect_wifi() -> network.WLAN:
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    # Default power-save parks the radio between AP beacons, measured 2026-09-12 as
+    # 33% packet loss and 115/622/1129 ms min/avg/max ping. This link carries ~12 Hz
+    # setpoint streams (continuous_trajectory_node), so the radio has to stay awake.
+    wlan.config(pm=network.WLAN.PM_NONE)
     # Set static IP before connecting so the address is predictable
     wlan.ifconfig((STATIC_IP, SUBNET_MASK, GATEWAY, DNS))
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)

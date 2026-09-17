@@ -12,6 +12,7 @@ from sensor_msgs.msg import JointState
 
 from esp32_bridge.transport import Esp32Transport, Esp32TransportError
 from facade_msgs.srv import ReadJointPositions
+from facadebot_description import robot_model
 
 # Must match SERVO_IDS in esp32_firmware/main.py (one servo per joint, base to end effector)
 _EXPECTED_SERVO_COUNT = 4
@@ -21,7 +22,7 @@ _JOINT_STREAM_TOPIC = "/facade_bot/joint_stream"  # continuous-motion setpoints 
 _QUEUE_DEPTH = 10  # small buffer - joint commands are infrequent, not a high-rate stream
 _READ_POSITIONS_SERVICE = "/facade_bot/read_joint_positions"
 
-_DEFAULT_ESP32_HOST = "192.168.1.100"  # must match STATIC_IP in esp32_firmware/main.py
+_DEFAULT_ESP32_HOST = "192.168.1.150"  # must match STATIC_IP in esp32_firmware/main.py
 _DEFAULT_ESP32_PORT = 5000  # must match TCP_PORT in esp32_firmware/main.py
 _DEFAULT_TIMEOUT_SEC = 7.0  # ESP32 now blocks the move ack until the shaped
                             # trajectory finishes (esp32_firmware/main.py's
@@ -45,7 +46,11 @@ _POSITION_MAX_RAW = 1000  # must match _POSITION_MAX in esp32_firmware/main.py
 # the user read them directly off the physical arm - not derived from the
 # URDF). This is now the 0° reference for that joint: commanded angles are
 # offset from here, not from raw position 0.
-_JOINT_CENTER_RAD = (2.09, 2.25, 2.05, 2.25)
+# STALE: measured on the v1 arm. The arm has since been rebuilt (URDF_V2), so
+# every one of these has to be re-read off the physical joints before the arm is
+# commanded. Unlike the limits, these are per-servo calibration rather than a
+# property of the model, so they are not in robot_model.yaml.
+_JOINT_CENTER_RAD = (2.17, 2.25, 2.05, 2.25)
 _JOINT_CENTER_DEG = tuple(math.degrees(r) for r in _JOINT_CENTER_RAD)
 _JOINT_CENTER_RAW = tuple(
     round(d * _POSITION_MAX_RAW / _SERVO_ANGLE_MAX_DEG) for d in _JOINT_CENTER_DEG
@@ -68,26 +73,50 @@ _POSITION_TOLERANCE_RAW = round(_POSITION_TOLERANCE_DEG * _POSITION_MAX_RAW / _S
 # gaps. 5 is empirical (observed on the arm).
 _MAX_READ_RETRIES = 5
 
+# read_joint_positions_fast trades retries for speed: measured on the arm, a
+# single attempt already gets all 4 joints about half the time (~170ms), while
+# the full _MAX_READ_RETRIES budget above occasionally stretches past 600ms
+# waiting for a joint that keeps missing its UART window. Callers that can
+# tolerate an occasional missing joint (e.g. a /joint_states publisher, which
+# can just hold a joint's last known reading) get a bounded, quick answer
+# instead of blocking behind that worst case. _check_move_completed's fault
+# check is NOT this - it needs the full retry budget above, since it is
+# deciding whether a move actually reached target.
+_FAST_READ_ATTEMPTS = 1
+_READ_POSITIONS_FAST_SERVICE = "/facade_bot/read_joint_positions_fast"
+
 # Per-joint safe range, degrees, relative to that joint's own _JOINT_CENTER_DEG
-# above (not an absolute 0-240° range, and no longer derived from the URDF -
-# joints 1-3 measured to have full travel around center, joint_4/wrist
-# measured to have less). This is the mandatory bounds-check CLAUDE.md
-# requires before any command reaches the Hiwonder board - the last-resort
-# gate, since a joint command can arrive here directly (e.g. `ros2 topic pub`,
-# bypassing facade_control's IK entirely). Must match
-# facade_control/kinematics.py's own copy of the same numbers.
-_JOINT_LIMITS_DEG = (
-    (-110.0, 110.0),  # joint_1
-    (-110.0, 110.0),  # joint_2
-    (-110.0, 110.0),  # joint_3
-    (-100.0, 100.0),  # joint_4: narrower, measured range
-)
+# above. Measured on the arm, not derived from the URDF - URDF_V2 declares every
+# joint `continuous` with no <limit> at all. The numbers now live in
+# facadebot_description's robot_model.yaml so this gate and facade_control's IK
+# cannot drift apart; _load_joint_limits() reads them once at startup.
+#
+# This is the mandatory bounds-check CLAUDE.md requires before any command
+# reaches the Hiwonder board - the last-resort gate, since a joint command can
+# arrive here directly (e.g. `ros2 topic pub`, bypassing facade_control's IK
+# entirely).
+_joint_limits_deg: tuple[tuple[float, float], ...] | None = None
+
+
+def _load_joint_limits() -> robot_model.RobotModel:
+    """Read the active arm's limits. Raises RobotModelError rather than guessing."""
+    global _joint_limits_deg
+    model = robot_model.load_robot_model()
+    if len(model.joints) != _EXPECTED_SERVO_COUNT:
+        raise robot_model.RobotModelError(
+            f"model '{model.name}' has {len(model.joints)} joints but the firmware "
+            f"drives {_EXPECTED_SERVO_COUNT} servos")
+    _joint_limits_deg = model.joint_limits_deg
+    return model
 
 
 def _check_joint_bounds(angles_deg: list[float]) -> list[str]:
     """Return one message per joint outside its safe range (empty if all OK)."""
+    if _joint_limits_deg is None:
+        raise robot_model.RobotModelError(
+            "joint limits were never loaded; refusing to bounds-check a command")
     violations = []
-    for i, (angle_deg, (lower, upper)) in enumerate(zip(angles_deg, _JOINT_LIMITS_DEG)):
+    for i, (angle_deg, (lower, upper)) in enumerate(zip(angles_deg, _joint_limits_deg)):
         if angle_deg < lower or angle_deg > upper:
             violations.append(
                 f"joint {i}: commanded {angle_deg:.1f} deg, outside safe range ({lower:.1f}-{upper:.1f} deg)"
@@ -140,6 +169,7 @@ class Esp32BridgeNode(LifecycleNode):
         self._subscription = None
         self._stream_subscription = None
         self._service = None
+        self._fast_service = None
 
     def on_configure(self, state: State) -> TransitionCallbackReturn:
         host = self.get_parameter("esp32_host").value
@@ -180,6 +210,11 @@ class Esp32BridgeNode(LifecycleNode):
             ReadJointPositions, _READ_POSITIONS_SERVICE, self._handle_read_joint_positions
         )
         self.get_logger().info(f"serving {_READ_POSITIONS_SERVICE}")
+
+        self._fast_service = self.create_service(
+            ReadJointPositions, _READ_POSITIONS_FAST_SERVICE, self._handle_read_joint_positions_fast
+        )
+        self.get_logger().info(f"serving {_READ_POSITIONS_FAST_SERVICE}")
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
@@ -192,6 +227,9 @@ class Esp32BridgeNode(LifecycleNode):
         if self._service is not None:
             self.destroy_service(self._service)
             self._service = None
+        if self._fast_service is not None:
+            self.destroy_service(self._fast_service)
+            self._fast_service = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
@@ -210,6 +248,9 @@ class Esp32BridgeNode(LifecycleNode):
         if self._service is not None:
             self.destroy_service(self._service)
             self._service = None
+        if self._fast_service is not None:
+            self.destroy_service(self._fast_service)
+            self._fast_service = None
         if self._transport is not None:
             self._transport.disconnect()
             self._transport = None
@@ -278,9 +319,9 @@ class Esp32BridgeNode(LifecycleNode):
         if response.get("status") != "ok":
             self.get_logger().warn(f"ESP32 rejected servo command: {response}")
 
-    def _read_positions_with_retry(self) -> list[int | None]:
+    def _read_positions_with_retry(self, max_attempts: int = _MAX_READ_RETRIES) -> list[int | None]:
         merged_positions_raw: list[int | None] = [None] * _EXPECTED_SERVO_COUNT
-        for _attempt in range(_MAX_READ_RETRIES):
+        for _attempt in range(max_attempts):
             try:
                 self._transport.send_command({"cmd": "read_positions"})
                 response = self._transport.read_response()
@@ -306,6 +347,18 @@ class Esp32BridgeNode(LifecycleNode):
         time.sleep(_FAULT_CHECK_MARGIN_MS / 1000.0)
 
         positions_raw = self._read_positions_with_retry()
+
+        # Every joint silent is a dead bus, not four simultaneous stalls: a stalled
+        # servo still answers a position read. Reported separately because the
+        # per-joint message below reads as "the arm tried and failed", which sends
+        # you looking at the mechanism instead of at power and wiring.
+        if all(position_raw is None for position_raw in positions_raw):
+            self.get_logger().error(
+                "servo bus fault - no joint answered a position read. The ESP32 acked the "
+                "move, but an ack only means the command reached the ESP32, never that a "
+                "servo received it. Check servo power, the ESP32-BusLinker TTL wiring and "
+                "its common ground, then run scripts/check_servo_bus.py over USB.")
+            return
 
         # target_positions_raw / commanded_angles_deg / positions_raw are all in
         # SERVO_IDS order (base -> end effector), so index i is the same joint in all three.
@@ -337,9 +390,33 @@ class Esp32BridgeNode(LifecycleNode):
         response.all_valid = all(p is not None for p in positions_raw)
         return response
 
+    def _handle_read_joint_positions_fast(
+        self, request: ReadJointPositions.Request, response: ReadJointPositions.Response
+    ) -> ReadJointPositions.Response:
+        # Same request/response shape as read_joint_positions - only the retry
+        # budget differs (see _FAST_READ_ATTEMPTS above). A missing joint here
+        # is expected and normal, not a fault: this is not the safety-critical
+        # path, so there is no log line for it - the caller is expected to
+        # handle response.all_valid being False as routine, not exceptional.
+        positions_raw = self._read_positions_with_retry(max_attempts=_FAST_READ_ATTEMPTS)
+
+        response.positions_deg = [
+            _position_raw_to_angle_deg(p, i) if p is not None else float("nan")
+            for i, p in enumerate(positions_raw)
+        ]
+        response.all_valid = all(p is not None for p in positions_raw)
+        return response
+
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
+    try:
+        model = _load_joint_limits()
+    except robot_model.RobotModelError as error:
+        print(f"esp32_bridge_node: refusing to start: {error}")
+        rclpy.shutdown()
+        raise SystemExit(1)
+    print(robot_model.describe(model))
     node = Esp32BridgeNode()
     executor = SingleThreadedExecutor()
     executor.add_node(node)
