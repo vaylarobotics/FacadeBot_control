@@ -62,10 +62,17 @@ def generate_launch_description() -> LaunchDescription:
         )
     )
 
-    # inactive -> active, once configure above has actually completed
+    # inactive -> active, once configure above has actually completed.
+    # start_state matters: a lifecycle node lands in "inactive" from three
+    # places - the end of configure (from "configuring"), a manual deactivate
+    # (from "deactivating"), and a failed activate (from "activating").
+    # Matching goal_state alone re-activated the bridge after every one of
+    # them, which made `ros2 lifecycle set ... deactivate` impossible to use as
+    # a stop while this launch was running.
     activate_after_configure = RegisterEventHandler(
         OnStateTransition(
             target_lifecycle_node=esp32_bridge_node,
+            start_state="configuring",
             goal_state="inactive",
             entities=[
                 EmitEvent(

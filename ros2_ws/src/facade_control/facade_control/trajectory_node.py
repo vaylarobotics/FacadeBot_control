@@ -9,11 +9,12 @@ from rclpy.node import Node
 
 from facade_msgs.action import FollowTrajectory
 from facade_msgs.msg import Waypoint
-from facade_msgs.srv import MoveToPose, ReadJointPositions
+from facade_msgs.srv import IsMoving, MoveToPose, ReadJointPositions
 
 _FOLLOW_TRAJECTORY_ACTION = "/facade_bot/follow_trajectory"
 _MOVE_TO_POSE_SERVICE = "/facade_bot/move_to_pose"  # must match facade_control_node's own constant
 _READ_JOINT_POSITIONS_SERVICE = "/facade_bot/read_joint_positions"  # must match esp32_bridge_node's own constant
+_IS_MOVING_SERVICE = "/facade_bot/is_moving"  # must match esp32_bridge_node's own constant
 
 # One thread runs the multi-waypoint execute callback; the other stays free so a
 # cancel request can actually be accepted while that callback is still running -
@@ -24,21 +25,24 @@ _EXECUTOR_THREAD_COUNT = 2
 # uses for the same "is it even there" check.
 _SERVICE_WAIT_TIMEOUT_SEC = 2.0
 
-# esp32_bridge is single-threaded, so a read_joint_positions call issued while a
-# move is in flight simply queues behind it until that move's ack arrives - up to
-# ~120ms pre-move readback + 5000ms max move_duration_ms clamp (esp32_firmware's
-# _DURATION_MAX_MS). This is the same worst case esp32_bridge_node.py's own 7.0s
-# timeout already covers, reused here rather than re-derived.
-_POLL_CALL_TIMEOUT_SEC = 7.0
+# A read issued during a move is now answered while the arm is still moving
+# (the firmware polls its socket between trajectory steps and esp32_bridge is
+# multi-threaded), so this no longer has to cover a whole move. What it must
+# cover is esp32_bridge's own full-retry read budget, which has been measured
+# past 600ms when a joint keeps missing its UART window.
+_POLL_CALL_TIMEOUT_SEC = 2.0
 
 # Overall per-waypoint budget from "move_to_pose returned" to "confirmed arrived"
-# before treating it as a stall. Sized for at least two full _POLL_CALL_TIMEOUT_SEC
-# attempts, so one slow-but-legitimate poll doesn't itself cause a false abort.
+# before treating it as a stall. This still has to outlast the move itself, not
+# just the polls: ~120ms pre-move readback + the 5000ms move_duration_ms clamp
+# (esp32_firmware's _DURATION_MAX_MS), plus settle and slack for steps pushed
+# late by the reads this loop is issuing.
 _WAYPOINT_STALL_TIMEOUT_SEC = 15.0
 
-# Sleep between poll attempts once a call returns but doesn't yet match target -
-# not shorter than esp32_bridge_node's own post-move settle margin (200ms), since
-# polling faster than the hardware's own settle window buys nothing.
+# Sleep between poll attempts. Not shorter than esp32_bridge_node's own post-move
+# settle margin (200ms), and now also a rate limit on the arm's behalf: each poll
+# costs servo-bus time that the trajectory stepper wants, so polling faster would
+# slow the move it is waiting on.
 _POLL_RETRY_INTERVAL_SEC = 0.3
 
 # Matches esp32_bridge_node.py's own _POSITION_TOLERANCE_DEG exactly - same
@@ -71,8 +75,9 @@ class TrajectoryNode(Node):
     cancel request can be accepted while a goal is still executing.
 
     V1 stops fully at each waypoint (reusing /facade_bot/move_to_pose and
-    confirming arrival via /facade_bot/read_joint_positions) rather than
-    blending continuously through them - see facade_control/README.md.
+    confirming arrival via /facade_bot/is_moving plus
+    /facade_bot/read_joint_positions) rather than blending continuously
+    through them - see facade_control/README.md.
     _wait_for_waypoint_arrival is the one piece expected to be replaced when
     blending is added later; goal handling, cancellation, feedback, and
     result construction below it should not need to change.
@@ -82,11 +87,11 @@ class TrajectoryNode(Node):
     same as facade_control_node.
 
     Safety note: canceling a goal means "don't command any further
-    waypoints," not "stop the arm instantly." There is no firmware/protocol
-    primitive to abort an in-flight physical move, and emergency-stop logic
-    is still not implemented (see CLAUDE.md). If a cancel arrives while
-    waiting for a waypoint, the arm still physically finishes whatever move
-    was already commanded.
+    waypoints," not "stop the arm instantly." The firmware can now report
+    whether it is moving, but there is still no primitive to abort an
+    in-flight physical move and emergency-stop logic is still not implemented
+    (see CLAUDE.md). If a cancel arrives while waiting for a waypoint, the arm
+    still physically finishes whatever move was already commanded.
     """
 
     def __init__(self) -> None:
@@ -117,6 +122,7 @@ class TrajectoryNode(Node):
         self._read_positions_client = self._client_node.create_client(
             ReadJointPositions, _READ_JOINT_POSITIONS_SERVICE
         )
+        self._is_moving_client = self._client_node.create_client(IsMoving, _IS_MOVING_SERVICE)
 
         self.get_logger().info(f"serving {_FOLLOW_TRAJECTORY_ACTION}")
 
@@ -193,15 +199,41 @@ class TrajectoryNode(Node):
             if goal_handle.is_cancel_requested:
                 return _CANCELED
 
-            actual_angles_deg = self._read_joint_positions()
-            if actual_angles_deg is not None and _within_tolerance(
-                actual_angles_deg, target_angles_deg, _WAYPOINT_POSITION_TOLERANCE_DEG
-            ):
-                return _ARRIVED
+            # Both conditions matter. Position alone is not enough any more: the
+            # firmware answers a read while it is still stepping a trajectory, so a
+            # waypoint whose start pose already sits within tolerance of its target
+            # would report "arrived" before the arm had moved at all, and the next
+            # waypoint would be commanded on top of an in-flight move.
+            if not self._is_arm_moving():
+                actual_angles_deg = self._read_joint_positions()
+                if actual_angles_deg is not None and _within_tolerance(
+                    actual_angles_deg, target_angles_deg, _WAYPOINT_POSITION_TOLERANCE_DEG
+                ):
+                    return _ARRIVED
 
             time.sleep(_POLL_RETRY_INTERVAL_SEC)
 
         return _STALLED
+
+    def _is_arm_moving(self) -> bool:
+        """True if the arm is moving, or if that could not be determined.
+
+        "Unknown" counts as moving on purpose: commanding the next waypoint while
+        the arm is still swinging is exactly the failure this check exists to
+        prevent, so a failed or unanswered query must never read as "stopped". A
+        service that never answers therefore ends the waypoint as a stall rather
+        than as an early arrival.
+        """
+        if not self._is_moving_client.wait_for_service(timeout_sec=_SERVICE_WAIT_TIMEOUT_SEC):
+            return True
+
+        future = self._is_moving_client.call_async(IsMoving.Request())
+        self._client_executor.spin_until_future_complete(future, timeout_sec=_POLL_CALL_TIMEOUT_SEC)
+
+        result = future.result()
+        if result is None or not result.valid:
+            return True
+        return result.is_moving
 
     def _call_move_to_pose(self, waypoint: Waypoint) -> MoveToPose.Response | None:
         if not self._move_to_pose_client.wait_for_service(timeout_sec=_SERVICE_WAIT_TIMEOUT_SEC):

@@ -45,6 +45,9 @@ TX2_PIN               = 17            # ESP32 GPIO17 → BusLinker TTL RX
 RX2_PIN               = 16            # ESP32 GPIO16 ← BusLinker TTL TX
 _READ_TIMEOUT_MS      = 10            # ms to wait for the first RX byte
 _READ_TIMEOUT_CHAR_MS = 5             # ms allowed between successive RX bytes
+# Whole-reply deadline timed on ticks_ms, not by the UART driver, whose timeout
+# returned empty after 1-2 ms on the board. Must match esp32_firmware/main.py.
+_READ_REPLY_DEADLINE_MS = 10
 _INTER_SERVO_DELAY_MS = 20            # gap between back-to-back sends on the bus
 
 # ── Servo protocol constants (LX-16A) ─────────────────────────────────────────
@@ -93,7 +96,14 @@ def find_response(raw: bytes, servo_id: int) -> int | None:
                 and raw[i + 2] == servo_id
                 and raw[i + 3] == _READ_RESPONSE_LEN
                 and raw[i + 4] == _CMD_POS_READ):
-            return (raw[i + 6] << 8) | raw[i + 5]
+            # Same acceptance as esp32_firmware/main.py _find_position_reply: a bad
+            # checksum or a position outside 0-1000 is not a valid reply. Must match.
+            checksum = (~(servo_id + _READ_RESPONSE_LEN + _CMD_POS_READ
+                          + raw[i + 5] + raw[i + 6])) & 0xFF
+            position_raw = (raw[i + 6] << 8) | raw[i + 5]
+            if raw[i + 7] != checksum or position_raw > _POSITION_MAX_RAW:
+                return None
+            return position_raw
     return None
 
 
@@ -113,7 +123,16 @@ def probe_servo(uart: UART, servo_id: int) -> tuple[str, int | None, bytes]:
         uart.read()  # drop stale bytes from a previous servo's late reply
     request = build_read_packet(servo_id)
     uart.write(request)
-    raw = uart.read(_READ_MAX_BYTES) or b""
+    raw = b""
+    deadline_ms = time.ticks_add(time.ticks_ms(), _READ_REPLY_DEADLINE_MS)
+    while len(raw) < _READ_MAX_BYTES and find_response(raw, servo_id) is None:
+        available = uart.any()
+        if available:
+            chunk = uart.read(available)
+            if chunk:
+                raw += chunk
+        elif time.ticks_diff(deadline_ms, time.ticks_ms()) <= 0:
+            break
     result, position_raw = classify(raw, request, servo_id)
     return result, position_raw, raw
 

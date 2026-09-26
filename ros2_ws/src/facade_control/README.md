@@ -8,63 +8,45 @@ changes to receive these commands.
 
 ## Arm geometry
 
-The arm is base yaw (`joint_1`) plus three parallel-axis pitch joints
-(`joint_2` shoulder, `joint_3` elbow, `joint_4` wrist) that all rotate
-within a single vertical plane whose azimuth is set by `joint_1`. This
-follows directly from `ros2_ws/src/facadebot_description/urdf/URDF_Test.urdf`:
-`joint_2`'s `<origin rpy="1.5708 -1.5708 0">` re-orients its rotation axis
-from the URDF's local `z` to the physical horizontal pitch axis; `joint_3`
-and `joint_4` have identity-rotation origins, so they inherit the same axis
-direction and stay parallel to `joint_2` regardless of angle.
+Nothing about the arm's shape is written into this package. `kinematics.py` is
+configured at startup from the model that `facadebot_description`'s
+`robot_model.yaml` names (`active_model`, currently `v2`): link offsets, joint
+origins and axes come from the generated `geometry_v2.yaml`, the joint limits
+and the joint_4-to-tool-tip offset from the hand-measured entries in
+`robot_model.yaml`. Every control node prints those numbers at startup; that
+banner is the geometry in force.
 
-Link lengths (`facade_control/kinematics.py`), taken straight from the
-URDF's joint origins:
+The closed-form solver handles exactly this shape and refuses anything else
+(`ModelStructureError`): a base yaw (`joint_1`), a shoulder and elbow rotating
+about parallel axes so they sweep one plane (`joint_2`, `joint_3`), and a wrist
+(`joint_4`) whose axis leaves that plane. On v2, joint_4's rotation tips the
+tool sideways out of the arm plane rather than pitching it within the plane as
+it did on v1; the solver reduces to the v1 case when the wrist axis happens to
+be parallel to the elbow's, so the retired model still solves.
 
-| Segment | Length | Source |
-|---|---|---|
-| Base → shoulder pivot height | 0.10061 m | `joint_1` origin `z` |
-| Shoulder → elbow | 0.12511 m | `joint_2`→`joint_3` origin `x` |
-| Elbow → wrist | 0.16511 m | `joint_3`→`joint_4` origin `x` |
-| Wrist → tool tip | 0.05 m | measured on hardware - not in the URDF |
-
-Non-obvious wrinkle: at all joint angles = 0 (the URDF's neutral pose), the
-arm points **straight up**, not horizontally outward. This was verified by
-composing the actual URDF origin rotations, not assumed - `kinematics.py`'s
-`forward_kinematics` is a literal transcription of those transforms (not a
-hand-simplified formula) specifically to avoid a wrong "textbook" zero
-reference.
-
-Joint limits, degrees, relative to each joint's own measured true center
-(see `esp32_bridge_node.py`'s `_JOINT_CENTER_RAD` for the centers
-themselves - no longer derived from the URDF). Must match
-`esp32_bridge_node.py`'s `_JOINT_LIMITS_DEG` - that copy is the hardware's
-last-resort gate, this one decides IK reachability before a command gets
-that far:
-
-| Joint | Range (relative to that joint's center) |
-|---|---|
-| `joint_1` | -110.0° – +110.0° |
-| `joint_2` | -110.0° – +110.0° |
-| `joint_3` | -110.0° – +110.0° |
-| `joint_4` | -100.0° – +100.0° |
+At all joint angles = 0 the arm points straight up (the URDF's neutral pose).
+`esp32_bridge` maps that 0 to each joint's separately measured centre
+(`_JOINT_CENTER_RAD`), and joint limits are measured relative to those centres.
+Whether the two zeros coincide on the physical v2 arm is still unverified (see
+`joint_state_publisher_node`'s `urdf_zero_offset_deg`).
 
 ## `tool_angle_deg` convention
 
-The tool's pointing direction, in degrees from horizontal, measured in the
-vertical plane that contains the target point (i.e. relative to the
-direction from the base straight toward `(x_m, y_m)`). `0°` = pointing
-level, away from the base; `+90°` = pointing straight up; negative =
-tilted down. This reference is anchored to the target's own azimuth
-(`atan2(y_m, x_m)`), not to any particular joint solution, since the same
-tool-tip pose can be reached two different ways (see below) that disagree
-on which way the base is actually facing.
+`tool_angle_deg` is **joint_4's own angle**, in degrees: how far the wrist tips
+the tool out of the shoulder/elbow plane. `0` keeps the tool in that plane.
+It is not the tool's pitch from horizontal; that was the v1 meaning, and the
+`.srv`/`.msg` comments now say so. `read_tool_pose` returns the same quantity,
+which is what makes forward and inverse kinematics exact inverses.
 
 ## Solving
 
-Two joint-angle families can reach the same tool-tip pose: turn the base
-to face the target and reach outward, or turn the base 180° away and fold
-the shoulder/elbow/wrist back over the top. `inverse_kinematics` tries
-both (and both elbow-bend directions within each), keeps every candidate
+Several joint configurations can reach the same tool-tip pose. With joint_4
+fixed by `tool_angle_deg`, the wrist and tool collapse into one rigid vector
+off the elbow; the base angle then has at most two solutions (the two
+directions that put the target the right distance out of the arm plane), and
+each of those has two elbow bends. A target on the base axis, such as the
+straight-up home pose, is reachable at any base angle, and the solver keeps the
+current one. `inverse_kinematics` tries every combination, keeps every candidate
 that lands inside every joint's safe range and - before trusting it -
 reproduces the requested target when run back through `forward_kinematics`.
 A target is rejected (`NotReachableError`) if it's geometrically out of
@@ -164,9 +146,16 @@ ros2 action send_goal /facade_bot/follow_trajectory facade_msgs/action/FollowTra
 
 For each waypoint in order: calls this node's own `move_to_pose` service
 (reusing its IK-solving and least-effort configuration selection as-is),
-then confirms the arm actually reached the solved joint angles by polling
-`esp32_bridge`'s `read_joint_positions` within a tolerance, before moving on
-to the next waypoint. Feedback reports `current_waypoint_index`/
+then confirms the arm actually reached the solved joint angles before moving
+on to the next waypoint. Arrival means **both** that `esp32_bridge`'s
+`is_moving` reports the arm has stopped **and** that `read_joint_positions` is
+within tolerance of the solved angles. Position alone is not sufficient: since
+the ESP32 firmware loop became non-blocking, a position read is answered while
+the arm is still moving, so a waypoint whose start pose already sits within
+tolerance of its target would otherwise report "arrived" before the arm had
+moved at all — and the next waypoint would be commanded on top of an in-flight
+move. An `is_moving` query that cannot be answered counts as *still moving*, so
+a dead bridge ends the waypoint as a stall rather than as an early arrival. Feedback reports `current_waypoint_index`/
 `total_waypoints` after each confirmed arrival. The result reports
 `success`, `message`, and `waypoints_completed` (how many waypoints were
 actually confirmed-reached, useful for telling how far a failed/canceled
@@ -179,11 +168,13 @@ waypoints at a steady speed (e.g. sweeping a surface), use
 separate actions and both remain available.
 
 **Cancellation caveat**: canceling a goal stops `trajectory_node` from
-commanding any *further* waypoints - it does not stop the arm mid-move.
-There's no firmware/protocol primitive to abort an in-flight physical move,
-and emergency-stop logic is still not implemented (see the top-level
-`CLAUDE.md`). If a cancel arrives while waiting on a waypoint, the arm
-still physically finishes whatever move was already commanded.
+commanding any *further* waypoints - it does not stop the arm mid-move. The
+firmware can now *report* whether it is moving (`/facade_bot/is_moving`), but
+there is still no primitive to abort an in-flight physical move, and
+emergency-stop logic is still not implemented (see the top-level `CLAUDE.md`;
+a software stop is deferred pending `DECISIONS.md` D1/D2). If a cancel arrives
+while waiting on a waypoint, the arm still physically finishes whatever move
+was already commanded.
 
 ## Following a trajectory continuously
 
@@ -240,8 +231,23 @@ raster's parallel passes are unaffected and only the U-turns get rounded.
   future work.
 
 **Cancellation caveat** is the same as `trajectory_node`'s: canceling stops
-further setpoints, but the arm coasts to the last one already commanded - there
-is no e-stop primitive.
+further setpoints, but the arm coasts to the last one already commanded. There is
+no stop control in software or firmware (the bench stop switch was removed
+2026-09-26); the only stop is the servo power plug.
+
+**Streaming and shaped moves do not mix politely.** At the firmware level a
+`servo` stream setpoint *preempts* a shaped `move_async` still in flight - both
+drive the same servos over the same UART, so the stepper is cancelled rather
+than left to fight the stream - and a shaped move arriving mid-motion is refused
+as `busy`.
+
+`esp32_bridge` sits in front of both and puts `joint_cmd` and `joint_stream` in
+one mutually exclusive callback group, so in practice commands from this package
+**serialise** and neither case is normally reached. What that does *not* give you
+is arbitration between goals: two action goals can still interleave their
+setpoints in the queue, the arm just executes the interleaving one command at a
+time. Do not run `trajectory_node` and `continuous_trajectory_node` against the
+arm at the same time (`DECISIONS.md` D3; one motion owner is still the design).
 
 ## Known limitations
 

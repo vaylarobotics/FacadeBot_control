@@ -41,6 +41,12 @@ _AXIS_PARALLEL_TOLERANCE = 1e-4
 _REACHABILITY_TOLERANCE_M = 1e-4
 _REACHABILITY_TOLERANCE_DEG = 0.05
 
+# A fully extended (or fully folded) arm puts the elbow's cos at exactly +/-1.
+# Forward kinematics computed in floating point hands that back as 1 + ~1e-16,
+# which a strict > 1.0 test rejects as unreachable. Anything inside this slack
+# is treated as exactly on the boundary; anything beyond it is really out of reach.
+_COS_INTERIOR_EPSILON = 1e-9
+
 _JOINT_COUNT = 4
 
 _FULL_TURN_DEG = 360.0
@@ -313,12 +319,16 @@ def _forward_kinematics_matches(angles_deg, target) -> bool:
 
 
 def _base_angle_candidates_rad(geometry: _Geometry, target_m,
-                               tool_in_elbow) -> list[float]:
+                               tool_in_elbow, fallback_base_rad: float) -> list[float]:
     """Angles for joint_1 that put the target the right distance out of the arm plane.
 
     Turning the base cannot change how far the tool tip sits off the
     shoulder/elbow plane - only joint_4 can - so matching that one distance
     pins joint_1 down to at most two choices.
+
+    A target sitting on joint_1's own axis (the straight-up home pose is one) is
+    reached at every base angle, so there is nothing to solve for: the base
+    simply stays where it is, which is what fallback_base_rad carries in.
     """
     to_target = _vec_sub(target_m, geometry.shoulder_m)
     in_base = _mat_vec(_transpose(geometry.base_rotation), to_target)
@@ -329,7 +339,11 @@ def _base_angle_candidates_rad(geometry: _Geometry, target_m,
     required = tool_in_elbow[2] - plane_normal[2] * in_base[2]
 
     magnitude = math.hypot(cos_coefficient, sin_coefficient)
-    if magnitude < _REACHABILITY_TOLERANCE_M or abs(required) > magnitude:
+    if magnitude < _REACHABILITY_TOLERANCE_M:
+        if abs(required) < _REACHABILITY_TOLERANCE_M:
+            return [fallback_base_rad]
+        return []
+    if abs(required) > magnitude:
         return []
 
     phase_rad = math.atan2(sin_coefficient, cos_coefficient)
@@ -345,7 +359,7 @@ def _elbow_solutions_rad(geometry: _Geometry, in_plane, tool_in_elbow):
 
     cos_interior = ((reach_m * reach_m - geometry.upper_arm_m ** 2 - forearm_m ** 2)
                     / (2.0 * geometry.upper_arm_m * forearm_m))
-    if abs(cos_interior) > 1.0:
+    if abs(cos_interior) > 1.0 + _COS_INTERIOR_EPSILON:
         return []
 
     interior_rad = math.acos(max(-1.0, min(1.0, cos_interior)))
@@ -388,8 +402,17 @@ def inverse_kinematics(
     target_m = (x_m, y_m, z_m)
     target = (x_m, y_m, z_m, tool_angle_deg)
 
+    # Only consulted when the target is on the base axis (see
+    # _base_angle_candidates_rad). Joint angles are stored relative to the
+    # joint's own spin direction, so undo that to get the solver's internal angle.
+    if current_angles_deg is None:
+        fallback_base_rad = 0.0
+    else:
+        fallback_base_rad = math.radians(current_angles_deg[0]) * geometry.spin[0]
+
     candidates = []
-    for base_rad in _base_angle_candidates_rad(geometry, target_m, tool_in_elbow):
+    for base_rad in _base_angle_candidates_rad(
+            geometry, target_m, tool_in_elbow, fallback_base_rad):
         to_target = _vec_sub(target_m, geometry.shoulder_m)
         in_base = _mat_vec(_transpose(geometry.base_rotation), to_target)
         in_plane = _mat_vec(_transpose(geometry.shoulder_rotation),

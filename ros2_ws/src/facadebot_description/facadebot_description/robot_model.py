@@ -13,6 +13,7 @@ limit all raise RobotModelError rather than falling back to a default. A node
 that cannot prove which arm it is driving must not drive it.
 """
 
+import hashlib
 import os
 from dataclasses import dataclass
 
@@ -111,8 +112,40 @@ def _parse_geometry_joint(entry: object, index: int,
     )
 
 
-def _load_geometry(geometry_path: str,
-                   model_name: str) -> tuple[str, str, list[Joint]]:
+def _sha256_of_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_geometry_matches_urdf(geometry: dict, geometry_path: str,
+                                   package_root: str, source_urdf: str) -> None:
+    """Refuse a geometry file that was generated from a different URDF than the
+    one on disk. Hashing the file is not parsing it, so the no-URDF-at-runtime
+    rule holds; this only catches a re-export that was never regenerated."""
+    declared_sha256 = geometry.get("source_urdf_sha256")
+    if not isinstance(declared_sha256, str) or not declared_sha256:
+        raise RobotModelError(
+            f"{geometry_path}: source_urdf_sha256 missing. Regenerate it with "
+            "scripts/generate_geometry.py.")
+    urdf_path = os.path.join(package_root, source_urdf)
+    if not os.path.isfile(urdf_path):
+        raise RobotModelError(
+            f"{geometry_path} was generated from {source_urdf}, but there is no such "
+            f"file at {urdf_path}, so the geometry cannot be checked against it.")
+    actual_sha256 = _sha256_of_file(urdf_path)
+    if actual_sha256 != declared_sha256:
+        raise RobotModelError(
+            f"{geometry_path} was generated from an older {source_urdf} (sha256 "
+            f"{declared_sha256[:12]}..., on disk {actual_sha256[:12]}...). The URDF "
+            "changed without the geometry being regenerated; run "
+            "scripts/generate_geometry.py and commit both files together.")
+
+
+def _load_geometry(geometry_path: str, model_name: str,
+                   package_root: str) -> tuple[str, str, list[Joint]]:
     """Read a generated geometry file. Returns (source_urdf, root_link, joints)."""
     geometry = _read_yaml_mapping(geometry_path, "geometry file")
 
@@ -131,6 +164,8 @@ def _load_geometry(geometry_path: str,
         raise RobotModelError(
             f"{geometry_path}: source_urdf and root_link are both required")
 
+    _require_geometry_matches_urdf(geometry, geometry_path, package_root, source_urdf)
+
     raw_joints = geometry.get("joints")
     if not isinstance(raw_joints, list) or not raw_joints:
         raise RobotModelError(f"{geometry_path}: joints missing or empty")
@@ -139,6 +174,13 @@ def _load_geometry(geometry_path: str,
         _parse_geometry_joint(entry, index, geometry_path)
         for index, entry in enumerate(raw_joints)
     ]
+
+    names = [joint.name for joint in joints]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise RobotModelError(
+            f"{geometry_path}: joint name(s) {duplicates} appear more than once; "
+            "limits are looked up by name, so every joint needs a unique one.")
 
     # The generator writes the chain base-to-tip and the solver relies on that
     # order, so re-check it here rather than trusting a file that may have been
@@ -241,7 +283,7 @@ def load_robot_model(config_path: str | None = None) -> RobotModel:
             f"model '{model_name}': no geometry file at {geometry_path}. "
             "Generate it with scripts/generate_geometry.py.")
 
-    source_urdf, root_link, joints = _load_geometry(geometry_path, model_name)
+    source_urdf, root_link, joints = _load_geometry(geometry_path, model_name, package_root)
     joint_names = tuple(joint.name for joint in joints)
 
     limits = _require_limits(model_config, model_name, joint_names)

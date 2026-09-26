@@ -110,10 +110,14 @@ def _start_stub(read_positions_handler) -> _StubNode:
     return stub_node
 
 
+def _make_node() -> continuous_trajectory_node.ContinuousTrajectoryNode:
+    return continuous_trajectory_node.ContinuousTrajectoryNode()
+
+
 def test_execute_callback_streams_setpoints_and_succeeds(ros_context):
     stub = _start_stub(_valid_read_handler)
 
-    node = continuous_trajectory_node.ContinuousTrajectoryNode()
+    node = _make_node()
     try:
         waypoints = [
             _waypoint_from_angles(_SEED_ANGLES_DEG),
@@ -142,7 +146,7 @@ def test_execute_callback_aborts_when_current_position_unreadable(ros_context):
 
     stub = _start_stub(read_handler)
 
-    node = continuous_trajectory_node.ContinuousTrajectoryNode()
+    node = _make_node()
     try:
         waypoints = [
             _waypoint_from_angles(_SEED_ANGLES_DEG),
@@ -161,7 +165,7 @@ def test_execute_callback_aborts_when_current_position_unreadable(ros_context):
 def test_execute_callback_aborts_before_moving_when_path_unreachable(ros_context):
     stub = _start_stub(_valid_read_handler)
 
-    node = continuous_trajectory_node.ContinuousTrajectoryNode()
+    node = _make_node()
     try:
         reachable = _waypoint_from_angles(_SEED_ANGLES_DEG)
         unreachable = Waypoint()
@@ -182,7 +186,7 @@ def test_execute_callback_aborts_before_moving_when_path_unreachable(ros_context
 def test_execute_callback_cancel_stops_the_stream(ros_context):
     stub = _start_stub(_valid_read_handler)
 
-    node = continuous_trajectory_node.ContinuousTrajectoryNode()
+    node = _make_node()
     try:
         # A slow speed over a real path makes many setpoints, so a cancel can land mid-stream.
         waypoints = [

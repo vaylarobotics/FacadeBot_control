@@ -12,7 +12,7 @@ so these addresses are the same on every boot.
 | Device | Address | Where it's set |
 |--------|---------|----------------|
 | RPi (wlan0) | `192.168.1.17` | NetworkManager profiles `TP-Link_08F3` and `Airtel_hart_5833`, both `ipv4.method manual` |
-| ESP32 | `192.168.1.100` | `STATIC_IP` in `esp32_firmware/main.py` |
+| ESP32 | `192.168.1.150` | `STATIC_IP` in `esp32_firmware/main.py` |
 | Gateway | `192.168.1.1` | Both networks use `192.168.1.0/24` |
 
 `TP-Link_08F3` is the network the RPi↔ESP32 link runs on — the ESP32 firmware
@@ -79,7 +79,7 @@ the REPL:
 - ESP32 + Hiwonder board powered, servos connected and powered.
 - Confirm the ESP32 joined Wi-Fi and is reachable at its static IP:
   ```bash
-  ping 192.168.1.100
+  ping 192.168.1.150
   ```
 
 ## 2a. Check the servo bus (whenever the arm does not move)
@@ -124,6 +124,56 @@ To clear the ESP32 itself, unplug the BusLinker, jumper GPIO17 straight to GPIO1
 `RUN_LOOPBACK_TEST = True` at the top of the script and re-run. A pass means the board's UART2
 is fine and the fault is in the wiring or downstream.
 
+## 2b. Or skip the hardware entirely — run the control loop against a simulated ESP32
+
+For testing the ROS2 control loop itself (bounds gate, IK, trajectory sequencing,
+`/joint_states`, RViz) with no ESP32, Hiwonder board, or servos attached at all.
+`scripts/fake_esp32_server.py` stands in for the real ESP32: it speaks
+`esp32_firmware/main.py`'s exact wire protocol over a plain TCP socket, with
+simulated joint positions instead of real ones.
+
+One command brings up the fake server plus all four nodes (`esp32_bridge_node`
+hardcoded to `esp32_host=127.0.0.1`, `facade_control_node`, `trajectory_node`,
+`joint_state_publisher_node`), auto-configures and activates the bridge exactly
+like `bringup.launch.py` does — verified end to end 2026-09-19 (see `STATUS.md`):
+
+```bash
+ros2 launch facade_control bringup_sim.launch.py
+```
+
+This is a **separate launch file from `bringup.launch.py`** on purpose — it can
+never be pointed at the real ESP32, so there is no parameter to mistype against
+real hardware. Steps 8, 9, 11, and 12 (and `display.launch.py`) all work
+unmodified against it, exactly as they would against the real bridge.
+
+All four joints start at a fake mid-travel position (raw 500, not the real arm's
+measured centers). `move_async` arms a motion and acks immediately, `status`
+reports whether it is still running, a second shaped move while one is in flight
+is refused as `busy`, and `servo` acks immediately and preempts — the same
+protocol the real firmware speaks. The legacy blocking `move` still blocks, so
+`use_blocking_move` can be exercised here too. Good enough to check waypoint
+arrival, streaming timing, and that `/joint_states` keeps updating through a move.
+It does **not** reproduce the real bus's flaky single-attempt reads (see the
+`esp32_bridge` README's readback notes), and it has no UART contention, so it
+cannot tell you the real feedback rate during a move — passing against this is not
+proof of hardware behavior. Still do the bench check (steps 2, 7a) on the real arm
+before trusting anything from here.
+
+If `esp32_bridge_node` doesn't reach `active` (`ros2 lifecycle get
+/esp32_bridge_node`), it's almost certainly the fake server's socket not yet
+listening when `on_configure` tried to connect — rerun
+`ros2 lifecycle set /esp32_bridge_node configure` by hand once the server's
+"listening on 127.0.0.1:5000" line has printed.
+
+To run the pieces separately instead (e.g. to point just the bridge at the
+simulator while running the other nodes by hand):
+
+```bash
+python3 scripts/fake_esp32_server.py
+# separate terminal:
+ros2 run esp32_bridge esp32_bridge_node --ros-args -p esp32_host:=127.0.0.1
+```
+
 ## 3. Build the ROS2 workspace (only needed after code changes under `ros2_ws/`)
 
 ```bash
@@ -156,14 +206,16 @@ python3 -c "from facadebot_description.robot_model import load_robot_model, desc
 
 That prints every origin, axis and limit in force, or explains why it refuses to load. It
 refuses — and so does every node — when the selected model has unmeasured limits or tool
-offset, when `geometry_file` is missing or names another arm's geometry, or when the geometry
-file's joint chain doesn't run base to tip.
+offset, when `geometry_file` is missing or names another arm's geometry, when the geometry
+file's joint chain doesn't run base to tip, when two joints share a name, or when the URDF on
+disk no longer matches the hash the geometry file was generated from.
 
 ### After re-exporting a URDF from SolidWorks
 
-The re-export does nothing on its own — the stack keeps running the old geometry until you
-regenerate. Re-run the generator, re-measure anything the new geometry invalidates, and commit
-both files together:
+The re-export alone makes every node refuse to start (a `RobotModelError` saying the URDF
+changed without the geometry being regenerated) — the stack will not silently run old
+geometry against a new arm. Re-run the generator, re-measure anything the new geometry
+invalidates, and commit both files together:
 
 ```bash
 cd /home/harthik/FacadeBot_control
@@ -207,8 +259,9 @@ ros2 launch facade_control bringup.launch.py
 
 This starts all three nodes and drives the bridge straight through `configure`
 then `activate`, so **the arm is live and commandable the moment this returns**
-— there is still no e-stop, so don't run it with anyone near the arm's reach
-envelope. `continuous_trajectory_node` is deliberately left out (run it by hand,
+— there is no stop control in software or firmware; the only stop is pulling the
+servo power plug, so keep it within reach and don't run this with anyone near the
+arm's reach envelope. `continuous_trajectory_node` is deliberately left out (run it by hand,
 `ros2 run facade_control continuous_trajectory_node`, only when you're
 specifically testing continuous sweeps — it's the one node not yet verified on
 real hardware). Skip steps 5, 6, 8, and 11 below if you use this; you still need
@@ -229,11 +282,10 @@ ros2 topic pub --once /facade_bot/joint_cmd sensor_msgs/msg/JointState \
   "{position: [0.0, 1.5708, 3.14159, 0.7854]}"
 ```
 
-or the demo trajectory script (talks to the ESP32 directly, bypassing ROS2 —
-useful for a quick hardware sanity check without bringing up the node):
-```bash
-python3 scripts/test_trajectory.py
-```
+Do **not** use `scripts/test_trajectory.py` for this. It opens its own socket to
+the ESP32 and sends absolute servo angles with no bounds check, so nothing stops it
+driving a joint into its mechanical stop. It is slated for removal (structural
+review, finding 4). Every motion command goes through the bridge above.
 
 ## 7a. Send the arm to the home position
 
@@ -310,6 +362,78 @@ the ESP32 only accepts one TCP client at a time, and the node holds its connecti
 open the whole time it's active. This service exists precisely so you don't have to
 fight that limitation; use it instead.
 
+## 9a. Check whether the arm is still moving
+
+```bash
+ros2 service call /facade_bot/is_moving facade_msgs/srv/IsMoving {}
+```
+
+Asks the ESP32 whether it is still stepping a shaped trajectory. Since the
+firmware loop became non-blocking, a move's ack means "accepted", not
+"finished" — this is how you tell the difference. `trajectory_node` uses it to
+decide a waypoint is reached (together with the position check in step 9).
+
+`valid: false` means the bridge could not reach the ESP32, **not** that the arm
+is stopped; `is_moving` is meaningless in that case. A `servo` stream setpoint
+does not register as moving — the firmware's stepper is not running for it.
+
+## 9b. Roll back to the blocking move protocol (only if the async path misbehaves)
+
+```bash
+ros2 lifecycle set /esp32_bridge_node deactivate
+ros2 lifecycle set /esp32_bridge_node cleanup      # closes the socket, so the new timeout is used on reconnect
+ros2 param set /esp32_bridge_node use_blocking_move true
+ros2 param set /esp32_bridge_node esp32_timeout_sec 7.0   # the blocking ack needs the old budget
+ros2 lifecycle set /esp32_bridge_node configure
+ros2 lifecycle set /esp32_bridge_node activate
+```
+The timeout is applied when the bridge connects (`configure`), so `cleanup` +
+`configure` is required. Deactivate/activate alone keeps the old 2 s timeout, and
+every blocking move then times out and reconnects (hit on the arm 2026-09-26). Under
+`bringup.launch.py` the `configure` is followed by an automatic `activate`, so the
+last line then just reports the node is already active.
+
+Puts the bridge back on the firmware's legacy `move`, which acks only once the
+trajectory has physically finished. No reflash needed — the firmware still
+serves both. **`/joint_states` stops updating during every move on this path**;
+that is the behaviour the async path exists to fix, so use this only to isolate
+a problem, not as a running configuration.
+
+## 9d. Measure shaped-move step timing (DECISIONS.md D13)
+
+Needs the firmware from 2026-09-26 or later (step 1). **The arm moves; nobody in
+reach, servo power plug within hand's reach.** After every `move_async` move, the bridge
+logs one line in its own terminal:
+```
+move timing: {'steps': 6, 'late_steps': 2, 'worst_idle_ms': 410, 'worst_write_ms': 81,
+              'worst_cmd_ms': 395, 'cmds': 14, 'worst_poll_ms': 6}
+```
+(example shape, not a measurement). Run the same pair of moves twice, first with the
+bridge alone (steps 5–6, so only its own `status` polls reach the ESP32), then under
+`bringup.launch.py` (step 5a, which adds 5 Hz `/joint_states` reads):
+```bash
+ros2 param set /esp32_bridge_node move_duration_ms 1000   # then repeat with 3000
+ros2 topic pub --once /facade_bot/joint_cmd sensor_msgs/msg/JointState "{position: [0.0, 0.0, 0.0, 0.0]}"
+ros2 topic pub --once /facade_bot/joint_cmd sensor_msgs/msg/JointState \
+  "{position: [0.0, -0.5235987756, 1.7453292519, 0.0]}"
+```
+Note for each move whether it looked staged, next to its log line.
+
+| Field | Meaning |
+|-------|---------|
+| `steps` | Shaped steps written (duration / ~150 ms) |
+| `late_steps` | Steps after which the servos sat still more than 20 ms waiting for the next one |
+| `worst_idle_ms` | Longest such wait: the length of the worst visible pause |
+| `worst_write_ms` | Longest step write to the servo bus (~80 ms expected) |
+| `worst_cmd_ms`, `cmds` | Longest time answering one Wi-Fi command mid-move, and how many were answered |
+| `worst_poll_ms` | Longest socket poll mid-move (5 ms expected) |
+
+Reading it: a large `worst_idle_ms` with a similar `worst_cmd_ms` means answering
+commands mid-move is what stalls the steps (a `read_positions` costs ~30 ms since the D13 fix, ~90 ms before; a
+`status` should cost a few). A large `worst_poll_ms` points at the Wi-Fi driver. A
+large `worst_write_ms` points at the servo bus. Large idle with none of these large
+is unexplained; report it as is. The `use_blocking_move` path (step 9b) logs nothing.
+
 ## 10. Check the arm's actual tool-tip pose (needs `facade_control_node` from step 8)
 
 Reads real joint angles back (via step 9's service) and runs them through
@@ -341,7 +465,7 @@ ros2 action send_goal /facade_bot/follow_trajectory facade_msgs/action/FollowTra
 Moves through each waypoint in order, stopping fully at each one before the
 next (no blending yet). Ctrl-C the `send_goal` call to cancel — this stops
 further waypoints from being commanded, but does **not** stop the arm
-mid-move (no e-stop primitive exists yet). See
+mid-move; the only way to do that is to pull the servo power plug. See
 `ros2_ws/src/facade_control/README.md`'s "Following a trajectory" section
 for the feedback/result fields and known limitations.
 
@@ -362,7 +486,7 @@ Unlike step 11, the tool tip flows through the waypoints at a constant speed
 (`tool_speed_mmps`) without stopping, rounding each corner within
 `corner_blend_m` instead of passing exactly through it. The whole path is
 planned and checked for reachability **before** any motion, then streamed to
-the arm. Start with a low speed on hardware. Cancellation and the no-e-stop
+the arm. Start with a low speed on hardware. Cancellation and the no-stop
 caveat are the same as step 11. See
 `ros2_ws/src/facade_control/README.md`'s "Following a trajectory continuously"
 section for the goal fields, tuning, and constraints.
@@ -468,6 +592,12 @@ works there directly and skips the network entirely.
 ros2 lifecycle set /esp32_bridge_node deactivate   # stop listening, keep ESP32 connection open
 ros2 lifecycle set /esp32_bridge_node cleanup       # close the ESP32 connection
 ```
+`deactivate` is currently the closest thing to a stop the stack has: the bridge
+stops accepting commands, but a move already sent to the ESP32 still finishes.
+The firmware can now *report* that it is still moving (step 9a) but still has no
+primitive to halt it — a software stop is deferred pending `DECISIONS.md` D1/D2.
+It works under `bringup.launch.py` too (the launch file only auto-activates after
+`configure`, not after every return to `inactive`).
 or just Ctrl-C the node in terminal A — `on_shutdown` tears down the subscription and the
 ESP32 connection either way.
 
@@ -477,7 +607,7 @@ ESP32 connection either way.
 - **Node builds/runs old behavior after editing code**: you skipped step 3 (rebuild) — the
   installed copy under `ros2_ws/install/` is a separate copy from `ros2_ws/src/`, it doesn't
   auto-update.
-- **`configure` fails / can't connect to ESP32**: confirm `ping 192.168.1.100` works first: it
+- **`configure` fails / can't connect to ESP32**: confirm `ping 192.168.1.150` works first: it
   isolates the problem to Wi-Fi/wiring vs. ROS2. If the ping fails, check the RPi is actually on
   the ESP32's network (`nmcli -t -f NAME,DEVICE con show --active` should show `TP-Link_08F3`) —
   it can't reach the ESP32 from the Airtel network. See step 0.
@@ -491,7 +621,9 @@ ESP32 connection either way.
 - **A node exits at startup with `RobotModelError`**: it refused to drive the arm because it
   can't prove which arm it is. Read the message — it names the cause: unmeasured joint limits or
   tool offset in `robot_model.yaml`, an `active_model` with no matching entry, a missing or
-  mismatched `geometry_file`, or a geometry file whose joint chain is out of order. See step 3a.
+  mismatched `geometry_file`, a geometry file whose joint chain is out of order or repeats a
+  joint name, or a URDF that was re-exported without regenerating the geometry file (hash
+  mismatch — rerun `scripts/generate_geometry.py`). See step 3a.
   This is fail-closed on purpose. If you must get past it for bench bring-up, set that model's
   `limits_source` to something other than `measured` so every node prints a warning banner at
   startup — never let copied-down numbers pass as measured ones.

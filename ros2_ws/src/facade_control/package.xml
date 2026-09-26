@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>rcl_interfaces</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>facade_msgs</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>

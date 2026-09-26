@@ -75,6 +75,60 @@ def test_least_travel_solution_is_chosen():
         assert expected == pytest.approx(actual, abs=1e-6)
 
 
+def test_current_position_decides_between_elbow_configurations():
+    """The same target, approached from near each elbow bend, must come back as
+    that bend - so this fails if current_angles_deg is ignored."""
+    elbow_a = (20.0, -60.0, 40.0, 30.0)
+    target = kinematics.forward_kinematics(*elbow_a)
+    solved_a = kinematics.inverse_kinematics(*target, current_angles_deg=elbow_a)
+
+    # Find the other bend: solve from far away on the elbow joint and look for a
+    # different, valid configuration reaching the same point.
+    probe = (elbow_a[0], elbow_a[1] + 90.0, -elbow_a[2], elbow_a[3])
+    solved_b = kinematics.inverse_kinematics(*target, current_angles_deg=probe)
+    assert solved_b[2] != pytest.approx(solved_a[2], abs=1.0), "expected a second elbow configuration"
+
+    # Seed from right next to each answer and check the solver stays on it.
+    near_a = tuple(angle + 3.0 for angle in solved_a)
+    near_b = tuple(angle - 3.0 for angle in solved_b)
+    assert kinematics.inverse_kinematics(*target, current_angles_deg=near_a) == pytest.approx(solved_a, abs=1e-6)
+    assert kinematics.inverse_kinematics(*target, current_angles_deg=near_b) == pytest.approx(solved_b, abs=1e-6)
+
+
+def test_home_pose_on_base_axis_solves_and_keeps_current_base_angle():
+    home = kinematics.forward_kinematics(0.0, 0.0, 0.0, 0.0)
+    # The CAD export leaves ~1 um of asymmetry; anything under the solver's own
+    # 0.1 mm reachability tolerance counts as on-axis.
+    assert math.hypot(home[0], home[1]) < 1e-4, "home pose should sit on the base axis"
+
+    # 1e-3 deg is ~250x finer than one servo count (0.24 deg); the residual
+    # comes from the same micrometre CAD asymmetry as above.
+    solved = kinematics.inverse_kinematics(*home, current_angles_deg=(0.0, 0.0, 0.0, 0.0))
+    assert solved == pytest.approx((0.0, 0.0, 0.0, 0.0), abs=1e-3)
+
+    solved_from_turned_base = kinematics.inverse_kinematics(*home, current_angles_deg=(35.0, 0.0, 0.0, 0.0))
+    assert solved_from_turned_base[0] == pytest.approx(35.0, abs=1e-3)
+    check = kinematics.forward_kinematics(*solved_from_turned_base)
+    assert check[:3] == pytest.approx(home[:3], abs=1e-5)
+
+
+def test_fully_extended_poses_survive_floating_point_noise(test_joint_limits_deg):
+    random.seed(7)
+    for _ in range(500):
+        angles = (
+            random.uniform(*test_joint_limits_deg[0]),
+            random.uniform(*test_joint_limits_deg[1]),
+            0.0,  # elbow straight: cos of the interior angle lands on +/-1
+            random.uniform(*test_joint_limits_deg[3]),
+        )
+        target = kinematics.forward_kinematics(*angles)
+        if math.hypot(target[0], target[1]) < 1e-3:
+            continue
+        solved = kinematics.inverse_kinematics(*target, current_angles_deg=angles)
+        check = kinematics.forward_kinematics(*solved)
+        assert check[:3] == pytest.approx(target[:3], abs=1e-3)
+
+
 def test_random_reachable_targets_round_trip(test_joint_limits_deg):
     random.seed(1234)
     for _ in range(200):
@@ -82,13 +136,7 @@ def test_random_reachable_targets_round_trip(test_joint_limits_deg):
             random.uniform(lower + 2.0, upper - 2.0) for lower, upper in test_joint_limits_deg
         )
         target = kinematics.forward_kinematics(*angles)
-        try:
-            solved = kinematics.inverse_kinematics(*target, current_angles_deg=angles)
-        except kinematics.NotReachableError:
-            # Straight-up poses put the tip on joint_1's axis, where the base
-            # angle is undefined. Genuinely unsolvable, not a solver bug.
-            assert math.hypot(target[0], target[1]) < 1e-3
-            continue
+        solved = kinematics.inverse_kinematics(*target, current_angles_deg=angles)
         check = kinematics.forward_kinematics(*solved)
         for expected, actual in zip(target[:3], check[:3]):
             assert expected == pytest.approx(actual, abs=1e-3)

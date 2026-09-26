@@ -1,0 +1,3 @@
+---
+bool is_moving  # true while the ESP32 is still stepping a shaped trajectory
+bool valid      # false if the status query to the ESP32 itself failed; is_moving is then meaningless

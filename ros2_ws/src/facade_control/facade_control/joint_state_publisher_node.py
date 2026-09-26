@@ -3,6 +3,7 @@ import math
 from rcl_interfaces.msg import ParameterDescriptor
 
 import rclpy
+import rclpy.logging
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -70,16 +71,28 @@ class JointStatePublisherNode(Node):
         # until that's actually checked: command [0,0,0,0], compare the real
         # arm's pose to what RViz renders for the URDF at all-zero, and fill
         # in whatever per-joint difference is seen.
+        # dynamic_typing: an override written as [0, 0, 5, 0] arrives as an
+        # integer array, which a fixed double-array declaration rejects outright.
+        # Accept either and convert below, so a whole-degree offset in a params
+        # file or on the command line is not a startup crash.
         self.declare_parameter(
             "urdf_zero_offset_deg", [0.0] * len(self._joint_names),
             ParameterDescriptor(description="per-joint offset from commanded-zero to the URDF's zero pose "
-                                             "(base to tip order) - unverified placeholder, see comment above"))
-        offset_deg = self.get_parameter("urdf_zero_offset_deg").value
+                                             "(base to tip order) - unverified placeholder, see comment above",
+                                dynamic_typing=True))
+        raw_offset = self.get_parameter("urdf_zero_offset_deg").value
+        try:
+            if any(isinstance(value, bool) for value in raw_offset):
+                raise TypeError("booleans are not angles")
+            offset_deg = [float(value) for value in raw_offset]
+        except (TypeError, ValueError) as error:
+            raise robot_model.RobotModelError(
+                f"urdf_zero_offset_deg must be a list of numbers, got {raw_offset!r}") from error
         if len(offset_deg) != len(self._joint_names):
             raise robot_model.RobotModelError(
                 f"urdf_zero_offset_deg has {len(offset_deg)} entries but the model has "
                 f"{len(self._joint_names)} joints")
-        self._offset_deg = list(offset_deg)
+        self._offset_deg = offset_deg
         self.get_logger().warn(
             "urdf_zero_offset_deg is unverified (default all 0.0 - assumes commanded-zero already "
             "matches the URDF's zero pose). Do not trust RViz's rendered pose against the real arm "
@@ -115,9 +128,15 @@ class JointStatePublisherNode(Node):
         self.get_logger().info(f"publishing {_JOINT_STATES_TOPIC} at {poll_rate_hz:.1f} Hz")
 
     def _poll_and_publish(self) -> None:
+        # A failed poll republishes the last known pose rather than returning
+        # empty-handed. Dropping the message instead makes /joint_states go
+        # silent, which downstream reads as "no data" rather than "unchanged" -
+        # robot_state_publisher simply stops updating /tf and RViz freezes the
+        # arm mid-pose with nothing on the graph saying why.
         if not self._read_positions_client.wait_for_service(timeout_sec=_SERVICE_WAIT_TIMEOUT_SEC):
             self.get_logger().warn(
                 f"{_READ_JOINT_POSITIONS_FAST_SERVICE} not available - is esp32_bridge active?")
+            self._publish_last_known()
             return
 
         future = self._read_positions_client.call_async(ReadJointPositions.Request())
@@ -126,12 +145,16 @@ class JointStatePublisherNode(Node):
         result = future.result()
         if result is None:
             self.get_logger().warn(f"{_READ_JOINT_POSITIONS_FAST_SERVICE} call timed out")
+            self._publish_last_known()
             return
 
         for i, angle_deg in enumerate(result.positions_deg):
             if not math.isnan(angle_deg):
                 self._last_known_rad[i] = math.radians(angle_deg + self._offset_deg[i])
 
+        self._publish_last_known()
+
+    def _publish_last_known(self) -> None:
         if any(angle_rad is None for angle_rad in self._last_known_rad):
             return  # haven't had a first successful reading for every joint yet
 
@@ -152,7 +175,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         node = JointStatePublisherNode()
     except robot_model.RobotModelError as error:
-        print(f"joint_state_publisher_node: refusing to start: {error}")
+        rclpy.logging.get_logger("joint_state_publisher_node").error(f"refusing to start: {error}")
         rclpy.shutdown()
         raise SystemExit(1)
     try:

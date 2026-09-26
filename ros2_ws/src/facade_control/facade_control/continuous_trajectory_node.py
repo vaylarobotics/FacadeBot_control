@@ -4,6 +4,7 @@ import time
 from rcl_interfaces.msg import ParameterDescriptor
 
 import rclpy
+import rclpy.logging
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
@@ -39,8 +40,12 @@ _DEFAULT_STREAM_PERIOD_SEC = 0.12
 _FEEDBACK_PERIOD_SEC = 0.5
 
 # Same "is the service even there / has it answered" figures trajectory_node uses.
+# The read timeout no longer has to cover a whole move queued ahead of it: the
+# firmware answers a read while it is still stepping a trajectory, and esp32_bridge
+# serves reads on their own executor thread. It covers the bridge's full-retry read
+# budget (measured past 600ms when a joint keeps missing its UART window) and jitter.
 _SERVICE_WAIT_TIMEOUT_SEC = 2.0
-_READ_CALL_TIMEOUT_SEC = 7.0
+_READ_CALL_TIMEOUT_SEC = 2.0
 
 
 class ContinuousTrajectoryNode(Node):
@@ -229,7 +234,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         model = kinematics.load_active_model()
     except robot_model.RobotModelError as error:
-        print(f"continuous_trajectory_node: refusing to start: {error}")
+        rclpy.logging.get_logger("continuous_trajectory_node").error(f"refusing to start: {error}")
         rclpy.shutdown()
         raise SystemExit(1)
     node = ContinuousTrajectoryNode()

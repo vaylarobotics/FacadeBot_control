@@ -12,7 +12,7 @@ from rclpy.node import Node
 
 from facade_control import trajectory_node
 from facade_msgs.msg import Waypoint
-from facade_msgs.srv import MoveToPose, ReadJointPositions
+from facade_msgs.srv import IsMoving, MoveToPose, ReadJointPositions
 
 
 def test_within_tolerance_true_when_all_joints_close():
@@ -50,24 +50,37 @@ class _FakeGoalHandle:
         self.status = "canceled"
 
 
-class _StubServicesNode(Node):
-    """Serves move_to_pose/read_joint_positions with test-scripted responses,
-    standing in for facade_control_node and esp32_bridge_node."""
+def _stopped_handler(request, response):
+    """Default is_moving stub: the arm is never moving. Tests that care about
+    the arm still being in motion pass their own handler."""
+    response.is_moving = False
+    response.valid = True
+    return response
 
-    def __init__(self, move_to_pose_handler, read_positions_handler):
+
+class _StubServicesNode(Node):
+    """Serves move_to_pose/read_joint_positions/is_moving with test-scripted
+    responses, standing in for facade_control_node and esp32_bridge_node."""
+
+    def __init__(self, move_to_pose_handler, read_positions_handler, is_moving_handler):
         super().__init__("stub_services_node")
         self._move_to_pose_handler = move_to_pose_handler
         self._read_positions_handler = read_positions_handler
+        self._is_moving_handler = is_moving_handler
         self.create_service(MoveToPose, trajectory_node._MOVE_TO_POSE_SERVICE, self._handle_move_to_pose)
         self.create_service(
             ReadJointPositions, trajectory_node._READ_JOINT_POSITIONS_SERVICE, self._handle_read_positions
         )
+        self.create_service(IsMoving, trajectory_node._IS_MOVING_SERVICE, self._handle_is_moving)
 
     def _handle_move_to_pose(self, request, response):
         return self._move_to_pose_handler(request, response)
 
     def _handle_read_positions(self, request, response):
         return self._read_positions_handler(request, response)
+
+    def _handle_is_moving(self, request, response):
+        return self._is_moving_handler(request, response)
 
 
 @pytest.fixture
@@ -92,10 +105,15 @@ def _make_waypoint(x_m=0.2, y_m=0.0, z_m=0.2, tool_angle_deg=0.0) -> Waypoint:
     return waypoint
 
 
-def _start_stub(move_to_pose_handler, read_positions_handler) -> _StubServicesNode:
-    stub_node = _StubServicesNode(move_to_pose_handler, read_positions_handler)
+def _start_stub(move_to_pose_handler, read_positions_handler,
+                is_moving_handler=_stopped_handler) -> _StubServicesNode:
+    stub_node = _StubServicesNode(move_to_pose_handler, read_positions_handler, is_moving_handler)
     threading.Thread(target=rclpy.spin, args=(stub_node,), daemon=True).start()
     return stub_node
+
+
+def _make_node() -> trajectory_node.TrajectoryNode:
+    return trajectory_node.TrajectoryNode()
 
 
 def test_execute_callback_happy_path(ros_context):
@@ -120,7 +138,7 @@ def test_execute_callback_happy_path(ros_context):
 
     _start_stub(move_to_pose_handler, read_positions_handler)
 
-    node = trajectory_node.TrajectoryNode()
+    node = _make_node()
     try:
         goal_handle = _FakeGoalHandle([_make_waypoint()])
         result = node._execute_callback(goal_handle)
@@ -151,7 +169,7 @@ def test_execute_callback_ik_failure_aborts_without_polling(ros_context):
 
     _start_stub(move_to_pose_handler, read_positions_handler)
 
-    node = trajectory_node.TrajectoryNode()
+    node = _make_node()
     try:
         goal_handle = _FakeGoalHandle([_make_waypoint()])
         result = node._execute_callback(goal_handle)
@@ -179,7 +197,7 @@ def test_execute_callback_stall_times_out(ros_context):
 
     _start_stub(move_to_pose_handler, read_positions_handler)
 
-    node = trajectory_node.TrajectoryNode()
+    node = _make_node()
     try:
         goal_handle = _FakeGoalHandle([_make_waypoint()])
         result = node._execute_callback(goal_handle)
@@ -209,7 +227,7 @@ def test_execute_callback_cancel_mid_poll(ros_context):
 
     _start_stub(move_to_pose_handler, read_positions_handler)
 
-    node = trajectory_node.TrajectoryNode()
+    node = _make_node()
     try:
         goal_handle = _FakeGoalHandle([_make_waypoint(), _make_waypoint()])
 
@@ -227,5 +245,85 @@ def test_execute_callback_cancel_mid_poll(ros_context):
         assert not result.success
         assert goal_handle.status == "canceled"
         assert result.waypoints_completed == 0
+    finally:
+        node.destroy_node()
+
+
+def test_execute_callback_waits_while_the_arm_is_still_moving(ros_context):
+    """Regression: position alone is not enough to call a waypoint reached.
+
+    Since the firmware loop became non-blocking, esp32_bridge answers a position
+    read while the arm is still stepping a trajectory. A waypoint whose start
+    pose already sits within tolerance of its target therefore looks "arrived"
+    the instant it is commanded, and the next waypoint would be sent on top of
+    an in-flight move. The arm must be reported stopped as well.
+    """
+    target_angles_deg = (0.0, 10.0, -10.0, 5.0)
+    is_moving_calls = {"n": 0}
+
+    def move_to_pose_handler(request, response):
+        response.success = True
+        response.message = "ok"
+        response.solved_angles_deg = list(target_angles_deg)
+        return response
+
+    def read_positions_handler(request, response):
+        # Always already at target - only the is_moving answer can hold the node back.
+        response.positions_deg = list(target_angles_deg)
+        response.all_valid = True
+        return response
+
+    def is_moving_handler(request, response):
+        is_moving_calls["n"] += 1
+        response.is_moving = is_moving_calls["n"] < 3
+        response.valid = True
+        return response
+
+    _start_stub(move_to_pose_handler, read_positions_handler, is_moving_handler)
+
+    node = _make_node()
+    try:
+        goal_handle = _FakeGoalHandle([_make_waypoint()])
+        result = node._execute_callback(goal_handle)
+
+        assert result.success
+        assert goal_handle.status == "succeeded"
+        assert is_moving_calls["n"] >= 3  # did not accept the first two "still moving" answers
+    finally:
+        node.destroy_node()
+
+
+def test_execute_callback_treats_unknown_motion_state_as_still_moving(ros_context):
+    """An is_moving query that comes back invalid must not read as "stopped" -
+    advancing on an unanswerable query is the failure the check exists to stop.
+    The waypoint stalls out instead."""
+    target_angles_deg = (0.0, 10.0, -10.0, 5.0)
+
+    def move_to_pose_handler(request, response):
+        response.success = True
+        response.message = "ok"
+        response.solved_angles_deg = list(target_angles_deg)
+        return response
+
+    def read_positions_handler(request, response):
+        response.positions_deg = list(target_angles_deg)
+        response.all_valid = True
+        return response
+
+    def is_moving_handler(request, response):
+        response.is_moving = False
+        response.valid = False  # bridge could not reach the ESP32
+        return response
+
+    _start_stub(move_to_pose_handler, read_positions_handler, is_moving_handler)
+
+    node = _make_node()
+    try:
+        goal_handle = _FakeGoalHandle([_make_waypoint()])
+        result = node._execute_callback(goal_handle)
+
+        assert not result.success
+        assert goal_handle.status == "aborted"
+        assert "possible stall" in result.message
     finally:
         node.destroy_node()

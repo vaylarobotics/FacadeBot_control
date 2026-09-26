@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ReadJointPositions.srv"
   "srv/MoveToPose.srv"
   "srv/ReadToolPose.srv"
+  "srv/IsMoving.srv"
   "msg/Waypoint.msg"
   "action/FollowTrajectory.action"
   "action/FollowTrajectoryContinuous.action"

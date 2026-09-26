@@ -1,6 +1,7 @@
 import math
 
 import rclpy
+import rclpy.logging
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -17,10 +18,14 @@ _READ_TOOL_POSE_SERVICE = "/facade_bot/read_tool_pose"
 _READ_JOINT_POSITIONS_SERVICE = "/facade_bot/read_joint_positions"  # must match esp32_bridge_node's own constant
 
 # How long to wait for esp32_bridge to be up / to answer a read_joint_positions
-# call before giving up - esp32_bridge's own retry loop is quick (a handful of
-# UART reads), so this just needs margin for that plus normal ROS2 service overhead.
+# call before giving up. esp32_bridge's own full-retry read budget is the thing
+# being waited on - a handful of UART reads, measured past 600ms when one joint
+# keeps missing its window - plus normal ROS2 service overhead. It no longer has
+# to allow for the call queueing behind an in-flight move: the firmware answers
+# reads mid-move and the bridge serves them on their own executor thread. Matches
+# trajectory_node's _POLL_CALL_TIMEOUT_SEC, which waits on the same service.
 _SERVICE_WAIT_TIMEOUT_SEC = 2.0
-_READ_JOINT_POSITIONS_TIMEOUT_SEC = 5.0
+_READ_JOINT_POSITIONS_TIMEOUT_SEC = 2.0
 
 
 class FacadeControlNode(Node):
@@ -180,7 +185,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         node = FacadeControlNode()
     except robot_model.RobotModelError as error:
-        print(f"facade_control_node: refusing to start: {error}")
+        rclpy.logging.get_logger("facade_control_node").error(f"refusing to start: {error}")
         rclpy.shutdown()
         raise SystemExit(1)
     try:

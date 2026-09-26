@@ -1,17 +1,20 @@
 import math
+import threading
 import time
 
 from rcl_interfaces.msg import ParameterDescriptor
 
 import rclpy
-from rclpy.executors import SingleThreadedExecutor
+import rclpy.logging
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.lifecycle import Node as LifecycleNode
 from rclpy.lifecycle import State, TransitionCallbackReturn
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 
 from esp32_bridge.transport import Esp32Transport, Esp32TransportError
-from facade_msgs.srv import ReadJointPositions
+from facade_msgs.srv import IsMoving, ReadJointPositions
 from facadebot_description import robot_model
 
 # Must match SERVO_IDS in esp32_firmware/main.py (one servo per joint, base to end effector)
@@ -21,14 +24,17 @@ _JOINT_CMD_TOPIC = "/facade_bot/joint_cmd"
 _JOINT_STREAM_TOPIC = "/facade_bot/joint_stream"  # continuous-motion setpoints (see continuous_trajectory_node)
 _QUEUE_DEPTH = 10  # small buffer - joint commands are infrequent, not a high-rate stream
 _READ_POSITIONS_SERVICE = "/facade_bot/read_joint_positions"
+_IS_MOVING_SERVICE = "/facade_bot/is_moving"
 
 _DEFAULT_ESP32_HOST = "192.168.1.150"  # must match STATIC_IP in esp32_firmware/main.py
 _DEFAULT_ESP32_PORT = 5000  # must match TCP_PORT in esp32_firmware/main.py
-_DEFAULT_TIMEOUT_SEC = 7.0  # ESP32 now blocks the move ack until the shaped
-                            # trajectory finishes (esp32_firmware/main.py's
-                            # move_joints_min_jerk): worst case ~120ms pre-move
-                            # readback + 5000ms max duration_ms clamp ~= 5.12s.
-                            # 7.0s leaves ~1.9s margin for Wi-Fi/TCP jitter.
+_DEFAULT_TIMEOUT_SEC = 2.0  # Every command the firmware serves now acks promptly:
+                            # the slowest is read_positions at ~170ms, and move_async
+                            # acks after only its ~120ms pre-move readback. 2.0s is
+                            # generous margin for Wi-Fi/TCP jitter on top of that.
+                            # NOTE: use_blocking_move (below) puts the bridge back on
+                            # the legacy `move`, which does block the ack until the
+                            # trajectory finishes - that needs esp32_timeout_sec:=7.0.
 _DEFAULT_MOVE_DURATION_MS = 1000  # JointState has no timing field; this fills the ESP32's duration_ms
 # duration_ms sent with each streamed "servo" setpoint. Should be about one stream step
 # (continuous_trajectory_node's stream_period_sec, ~120ms) so the servo interpolates
@@ -46,21 +52,45 @@ _POSITION_MAX_RAW = 1000  # must match _POSITION_MAX in esp32_firmware/main.py
 # the user read them directly off the physical arm - not derived from the
 # URDF). This is now the 0° reference for that joint: commanded angles are
 # offset from here, not from raw position 0.
-# STALE: measured on the v1 arm. The arm has since been rebuilt (URDF_V2), so
-# every one of these has to be re-read off the physical joints before the arm is
-# commanded. Unlike the limits, these are per-servo calibration rather than a
-# property of the model, so they are not in robot_model.yaml.
+# Current for the v2 arm, confirmed by the user 2026-09-21. joint_1 was re-measured
+# during the v2 rebuild and moved from v1's 2.09 to 2.17 (commit c751abc); joints
+# 2-4 were re-checked and came back at their v1 values. Unlike the limits, these are
+# per-servo calibration rather than a property of the model, so they are not in
+# robot_model.yaml. Re-measure and re-date this line if a servo is swapped or
+# re-horned.
 _JOINT_CENTER_RAD = (2.17, 2.25, 2.05, 2.25)
 _JOINT_CENTER_DEG = tuple(math.degrees(r) for r in _JOINT_CENTER_RAD)
 _JOINT_CENTER_RAW = tuple(
     round(d * _POSITION_MAX_RAW / _SERVO_ANGLE_MAX_DEG) for d in _JOINT_CENTER_DEG
 )
 
-# Small settle margin before reading positions back - the ESP32 now blocks the
-# move ack until the full shaped trajectory (including the final step) has been
-# sent (esp32_firmware/main.py's move_joints_min_jerk), so this no longer needs
-# to cover duration_ms itself, just LX-16A mechanical settle after the last write.
+# Small settle margin before reading positions back. The move ack no longer means
+# "finished" - _wait_for_motion_complete polls the firmware's `status` command until
+# it reports the shaped trajectory is done, so by the time this runs the last step
+# has been written and this only needs to cover LX-16A mechanical settle.
 _FAULT_CHECK_MARGIN_MS = 200
+
+# How often to ask the ESP32 whether it is still moving. A status query never
+# touches the servo bus, but it is not free: it occupies one firmware main-loop
+# iteration and competes for Wi-Fi airtime with the position reads and the
+# setpoint stream. 50ms is one third of the firmware's _TRAJECTORY_STEP_MS
+# (150ms), so a finished move is noticed well inside one step without adding a
+# meaningful share of the traffic. Re-measure if the step interval changes.
+_STATUS_POLL_INTERVAL_SEC = 0.05
+
+# The legacy blocking `move` does not ack until its trajectory has finished, so
+# use_blocking_move needs the old socket budget: ~120ms pre-move readback + the
+# firmware's 5000ms _DURATION_MAX_MS clamp ~= 5.12s. Refusing to configure below
+# this is deliberate - the rollback silently timing out on every move, and then
+# tearing down the connection to resync, is a worse state than the bug it rolls
+# back from.
+_BLOCKING_MOVE_MIN_TIMEOUT_SEC = 7.0
+
+# Give up waiting for a move to finish after this long and skip the fault check.
+# Derived from the firmware's own worst case: ~120ms pre-move readback + the
+# 5000ms _DURATION_MAX_MS clamp, plus margin for steps pushed late by interleaved
+# position reads (see _TRAJECTORY_STEP_MS in esp32_firmware/main.py).
+_MOVE_COMPLETION_TIMEOUT_SEC = 8.0
 
 # A joint counts as "reached" within this many degrees of the commanded angle.
 # Starting estimate pending real-hardware calibration. Converted to raw units since
@@ -72,6 +102,12 @@ _POSITION_TOLERANCE_RAW = round(_POSITION_TOLERANCE_DEG * _POSITION_MAX_RAW / _S
 # (esp32_firmware/main.py); usually one servo per call. Retry and merge to fill
 # gaps. 5 is empirical (observed on the arm).
 _MAX_READ_RETRIES = 5
+
+# One thread runs a move's status-poll loop; the others stay free so position
+# reads and the is_moving service can still be answered while it does. Without
+# this the node would serialise them again and /joint_states would go silent for
+# the length of every move, which is the bug the non-blocking firmware fixes.
+_EXECUTOR_THREAD_COUNT = 4
 
 # read_joint_positions_fast trades retries for speed: measured on the arm, a
 # single attempt already gets all 4 joints about half the time (~170ms), while
@@ -164,17 +200,47 @@ class Esp32BridgeNode(LifecycleNode):
             "servo_move_duration_ms", _DEFAULT_SERVO_MOVE_DURATION_MS,
             ParameterDescriptor(description="milliseconds per streamed setpoint; keep in step with "
                                             "continuous_trajectory_node's stream_period_sec"))
+        self.declare_parameter(
+            "use_blocking_move", False,
+            ParameterDescriptor(description="rollback: send the firmware's legacy blocking `move` "
+                                            "instead of `move_async` + status polling. Needs "
+                                            "esp32_timeout_sec:=7.0, and stops /joint_states "
+                                            "updating during a move"))
+
+        # The ESP32 answers one line per command with no correlation ID, so two
+        # threads must never have commands in flight at the same time. Held across
+        # each send/read pair (see _transact), never across a sequence of them.
+        self._transport_lock = threading.Lock()
+        # Reads and status queries are reentrant so one can be answered while a
+        # move's status poll is in progress - that is the whole point of the
+        # change, and under the default group they would serialise again.
+        self._service_callback_group = ReentrantCallbackGroup()
+        # The two command topics deliberately do NOT share that. They get one
+        # mutually exclusive group between them, so only one command is ever in
+        # flight: two joint_cmd messages running at once would race for the
+        # transport lock and let the older target win arbitrarily, and a stream
+        # setpoint overlapping a move would preempt it in the firmware while this
+        # node was still polling for that move to finish.
+        self._command_callback_group = MutuallyExclusiveCallbackGroup()
 
         self._transport: Esp32Transport | None = None
         self._subscription = None
         self._stream_subscription = None
         self._service = None
         self._fast_service = None
+        self._is_moving_service = None
 
     def on_configure(self, state: State) -> TransitionCallbackReturn:
         host = self.get_parameter("esp32_host").value
         port = self.get_parameter("esp32_port").value
         timeout_sec = self.get_parameter("esp32_timeout_sec").value
+
+        if self.get_parameter("use_blocking_move").value and timeout_sec < _BLOCKING_MOVE_MIN_TIMEOUT_SEC:
+            self.get_logger().error(
+                f"use_blocking_move needs esp32_timeout_sec >= {_BLOCKING_MOVE_MIN_TIMEOUT_SEC} "
+                f"(the blocking ack waits out the whole move), got {timeout_sec}. Refusing to "
+                "configure rather than time out on every move.")
+            return TransitionCallbackReturn.FAILURE
 
         transport = Esp32Transport(host, port, timeout_sec)
         try:
@@ -197,24 +263,35 @@ class Esp32BridgeNode(LifecycleNode):
             depth=_QUEUE_DEPTH,
         )
         self._subscription = self.create_subscription(
-            JointState, _JOINT_CMD_TOPIC, self._joint_cmd_callback, qos
+            JointState, _JOINT_CMD_TOPIC, self._joint_cmd_callback, qos,
+            callback_group=self._command_callback_group
         )
         self.get_logger().info(f"listening on {_JOINT_CMD_TOPIC}")
 
         self._stream_subscription = self.create_subscription(
-            JointState, _JOINT_STREAM_TOPIC, self._joint_stream_callback, qos
+            JointState, _JOINT_STREAM_TOPIC, self._joint_stream_callback, qos,
+            callback_group=self._command_callback_group
         )
         self.get_logger().info(f"listening on {_JOINT_STREAM_TOPIC}")
 
         self._service = self.create_service(
-            ReadJointPositions, _READ_POSITIONS_SERVICE, self._handle_read_joint_positions
+            ReadJointPositions, _READ_POSITIONS_SERVICE, self._handle_read_joint_positions,
+            callback_group=self._service_callback_group
         )
         self.get_logger().info(f"serving {_READ_POSITIONS_SERVICE}")
 
         self._fast_service = self.create_service(
-            ReadJointPositions, _READ_POSITIONS_FAST_SERVICE, self._handle_read_joint_positions_fast
+            ReadJointPositions, _READ_POSITIONS_FAST_SERVICE, self._handle_read_joint_positions_fast,
+            callback_group=self._service_callback_group
         )
         self.get_logger().info(f"serving {_READ_POSITIONS_FAST_SERVICE}")
+
+        self._is_moving_service = self.create_service(
+            IsMoving, _IS_MOVING_SERVICE, self._handle_is_moving,
+            callback_group=self._service_callback_group
+        )
+        self.get_logger().info(f"serving {_IS_MOVING_SERVICE}")
+
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
@@ -230,12 +307,19 @@ class Esp32BridgeNode(LifecycleNode):
         if self._fast_service is not None:
             self.destroy_service(self._fast_service)
             self._fast_service = None
+        if self._is_moving_service is not None:
+            self.destroy_service(self._is_moving_service)
+            self._is_moving_service = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
-        if self._transport is not None:
-            self._transport.disconnect()
-            self._transport = None
+        # Under the lock: a move thread can still be inside _transact, and
+        # pulling the transport out from under it would raise AttributeError
+        # (not Esp32TransportError) and take down an executor thread.
+        with self._transport_lock:
+            if self._transport is not None:
+                self._transport.disconnect()
+                self._transport = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
@@ -251,9 +335,16 @@ class Esp32BridgeNode(LifecycleNode):
         if self._fast_service is not None:
             self.destroy_service(self._fast_service)
             self._fast_service = None
-        if self._transport is not None:
-            self._transport.disconnect()
-            self._transport = None
+        if self._is_moving_service is not None:
+            self.destroy_service(self._is_moving_service)
+            self._is_moving_service = None
+        # Under the lock: a move thread can still be inside _transact, and
+        # pulling the transport out from under it would raise AttributeError
+        # (not Esp32TransportError) and take down an executor thread.
+        with self._transport_lock:
+            if self._transport is not None:
+                self._transport.disconnect()
+                self._transport = None
         return TransitionCallbackReturn.SUCCESS
 
     def _joint_cmd_callback(self, msg: JointState) -> None:
@@ -272,20 +363,110 @@ class Esp32BridgeNode(LifecycleNode):
             return
 
         duration_ms = self.get_parameter("move_duration_ms").value
+        use_blocking_move = self.get_parameter("use_blocking_move").value
         target_positions_raw = [_angle_deg_to_position_raw(a, i) for i, a in enumerate(angles_deg)]
-        command = {"cmd": "move", "positions": target_positions_raw, "duration_ms": duration_ms}
+        command = {
+            "cmd": "move" if use_blocking_move else "move_async",
+            "positions": target_positions_raw,
+            "duration_ms": duration_ms,
+        }
         try:
-            self._transport.send_command(command)
-            response = self._transport.read_response()
+            response = self._transact(command)
         except Esp32TransportError as exc:
             self.get_logger().error(f"ESP32 command failed: {exc}")
             return
 
-        if response.get("status") != "ok":
-            self.get_logger().warn(f"ESP32 rejected command: {response}")
-        else:
-            self.get_logger().info(f"sent {angles_deg} deg, ESP32 ack ok")
-            self._check_move_completed(target_positions_raw, angles_deg)
+        status = response.get("status")
+        if status == "busy":
+            # The firmware refuses a second shaped move rather than changing the
+            # arm's direction mid-swing. Nothing queues it: this command is dropped.
+            self.get_logger().warn(
+                "move rejected - the ESP32 is still executing a previous move. "
+                "Commands are not queued; re-send once the arm has stopped.")
+            return
+        if status != "ok":
+            # Includes the firmware refusing to start a move whose start pose it
+            # could not read: it never guesses one, so the arm has not moved.
+            self.get_logger().error(f"ESP32 refused the move, the arm did not move: {response}")
+            return
+
+        self.get_logger().info(f"sent {angles_deg} deg, ESP32 ack ok")
+        # The legacy blocking `move` only acks once the trajectory is done, so
+        # there is nothing to wait for on that path.
+        if not use_blocking_move and not self._wait_for_motion_complete():
+            return
+        self._check_move_completed(target_positions_raw, angles_deg)
+
+    def _transact(self, command: dict) -> dict:
+        """Send one command and read its reply with the transport held exclusively.
+
+        The ESP32 answers one line per command and there is no correlation ID, so
+        two threads with commands in flight at once would mis-pair replies. The
+        lock covers the send/read pair and nothing wider: anything needing several
+        round trips takes it once per round trip, so other callbacks get in between.
+        """
+        with self._transport_lock:
+            if self._transport is None:
+                raise Esp32TransportError("transport is not connected")
+            try:
+                self._transport.send_command(command)
+                return self._transport.read_response()
+            except Esp32TransportError:
+                # A failed exchange breaks the request/reply pairing for good (see
+                # Esp32Transport.reconnect), so the socket is rebuilt before anyone
+                # else is allowed a turn. Without this, one timeout makes every
+                # later command answer the previous one's question - including a
+                # `status` poll answering with a stale move ack.
+                try:
+                    self._transport.reconnect()
+                    self.get_logger().warn(
+                        "transport error - reconnected to the ESP32. Any move in progress was "
+                        "abandoned when the socket closed; the arm holds where it stopped.")
+                except Esp32TransportError as reconnect_error:
+                    self.get_logger().error(
+                        f"transport error, and reconnecting failed: {reconnect_error}")
+                raise
+
+    def _wait_for_motion_complete(self) -> bool:
+        """Poll the ESP32 until it reports the shaped trajectory has finished.
+
+        This is what replaces the old blocking ack. Releasing the lock between
+        polls is the point of the exercise - that gap is when a position read can
+        be served, which is what keeps /joint_states alive during a move.
+
+        Returns False if the move could not be confirmed finished, in which case
+        the caller skips the fault check rather than judging a moving arm.
+        """
+        deadline = time.monotonic() + _MOVE_COMPLETION_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            try:
+                response = self._transact({"cmd": "status"})
+            except Esp32TransportError as exc:
+                self.get_logger().error(f"status poll failed, skipping move fault check: {exc}")
+                return False
+            if response.get("status") != "ok" or "moving" not in response:
+                # A reply with no `moving` field is "cannot tell", never "stopped":
+                # treating it as stopped would run the fault check against a moving
+                # arm, which is the failure this poll exists to avoid.
+                self.get_logger().warn(f"unexpected status reply, skipping move fault check: {response}")
+                return False
+            if not response["moving"]:
+                self._log_move_timing(response)
+                return True
+            time.sleep(_STATUS_POLL_INTERVAL_SEC)
+
+        self.get_logger().error(
+            f"ESP32 still reports moving after {_MOVE_COMPLETION_TIMEOUT_SEC:.0f}s - skipping "
+            "the move fault check. The arm may still be in motion.")
+        return False
+
+    def _log_move_timing(self, status_reply: dict) -> None:
+        # Diagnostic only (DECISIONS.md D13): whether shaped steps went out late
+        # enough for the servos to stop between them. Older firmware and the
+        # simulator send no "timing" field; that is not an error.
+        timing = status_reply.get("timing")
+        if isinstance(timing, dict):
+            self.get_logger().info(f"move timing: {timing}")
 
     def _joint_stream_callback(self, msg: JointState) -> None:
         angles_deg = [math.degrees(p) for p in msg.position]
@@ -310,8 +491,7 @@ class Esp32BridgeNode(LifecycleNode):
         target_positions_raw = [_angle_deg_to_position_raw(a, i) for i, a in enumerate(angles_deg)]
         command = {"cmd": "servo", "positions": target_positions_raw, "duration_ms": duration_ms}
         try:
-            self._transport.send_command(command)
-            response = self._transport.read_response()
+            response = self._transact(command)
         except Esp32TransportError as exc:
             self.get_logger().warn(f"ESP32 servo command failed: {exc}")
             return
@@ -323,8 +503,7 @@ class Esp32BridgeNode(LifecycleNode):
         merged_positions_raw: list[int | None] = [None] * _EXPECTED_SERVO_COUNT
         for _attempt in range(max_attempts):
             try:
-                self._transport.send_command({"cmd": "read_positions"})
-                response = self._transport.read_response()
+                response = self._transact({"cmd": "read_positions"})
             except Esp32TransportError as exc:
                 self.get_logger().warn(f"read_positions failed, aborting readback: {exc}")
                 return merged_positions_raw
@@ -407,18 +586,48 @@ class Esp32BridgeNode(LifecycleNode):
         response.all_valid = all(p is not None for p in positions_raw)
         return response
 
+    def _handle_is_moving(
+        self, request: IsMoving.Request, response: IsMoving.Response
+    ) -> IsMoving.Response:
+        # Asked of the ESP32 on every call rather than answered from a flag kept
+        # here: the firmware is the authoritative source for whether the arm is
+        # moving, and this node can restart while the arm does not (CLAUDE.md).
+        try:
+            reply = self._transact({"cmd": "status"})
+        except Esp32TransportError as exc:
+            self.get_logger().warn(f"is_moving query failed: {exc}")
+            response.is_moving = False
+            response.valid = False
+            return response
+
+        if reply.get("status") != "ok" or "moving" not in reply:
+            # valid=False, not is_moving=False - callers treat unknown as moving.
+            self.get_logger().warn(f"unexpected status reply: {reply}")
+            response.is_moving = False
+            response.valid = False
+            return response
+
+        response.is_moving = bool(reply["moving"])
+        response.valid = True
+        return response
+
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     try:
         model = _load_joint_limits()
     except robot_model.RobotModelError as error:
-        print(f"esp32_bridge_node: refusing to start: {error}")
+        rclpy.logging.get_logger("esp32_bridge_node").error(f"refusing to start: {error}")
         rclpy.shutdown()
         raise SystemExit(1)
-    print(robot_model.describe(model))
     node = Esp32BridgeNode()
-    executor = SingleThreadedExecutor()
+    # The banner carries the "NOT measured" warning for a placeholder model; at
+    # info it would vanish under --log-level warn, which is exactly when it matters.
+    if model.limits_source == robot_model._LIMITS_SOURCE_MEASURED:
+        node.get_logger().info(robot_model.describe(model))
+    else:
+        node.get_logger().warn(robot_model.describe(model))
+    executor = MultiThreadedExecutor(num_threads=_EXECUTOR_THREAD_COUNT)
     executor.add_node(node)
     try:
         executor.spin()

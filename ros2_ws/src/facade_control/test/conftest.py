@@ -44,6 +44,9 @@ def _build_model(model_name: str):
     for geometry_file in glob(os.path.join(share_dir, "config", "geometry_*.yaml")):
         os.symlink(geometry_file,
                    os.path.join(temp_config_dir, os.path.basename(geometry_file)))
+    # The loader hashes each geometry file's source URDF to prove they match, so
+    # the URDFs have to be reachable from the temp package root as well.
+    os.symlink(os.path.join(share_dir, "urdf"), os.path.join(temp_dir, "urdf"))
     temp_config_path = os.path.join(temp_config_dir, "robot_model.yaml")
     with open(temp_config_path, "w") as temp_config:
         yaml.safe_dump(config, temp_config)

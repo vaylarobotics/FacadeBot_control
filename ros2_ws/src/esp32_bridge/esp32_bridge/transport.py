@@ -41,6 +41,22 @@ class Esp32Transport:
         self._sock = sock
         self._sock_file = sock_file
 
+    def reconnect(self) -> None:
+        """Tear the connection down and build a fresh one.
+
+        The only safe answer to a failed exchange. The protocol is one reply line
+        per command with no correlation ID, so a read that times out leaves the
+        ESP32's reply (whenever it arrives) queued as the answer to the *next*
+        command - every request/reply pair after that is off by one. On top of
+        that, socket.makefile()'s buffer is explicitly undefined after a timeout.
+        Neither is recoverable by draining, so the socket is replaced instead.
+
+        Note the ESP32 abandons any move in progress when its client disconnects,
+        so this stops the arm wherever the last trajectory step put it.
+        """
+        self.disconnect()
+        self.connect()
+
     def disconnect(self) -> None:
         if self._sock is not None:
             self._sock.close()
